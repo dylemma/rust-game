@@ -25,9 +25,20 @@ use futures::{future, Future};
 use tokio_proto::TcpServer;
 
 fn main() {
-    let addr = "127.0.0.1:12345".parse().unwrap();
-    let server = TcpServer::new(LineProto, addr);
-    server.serve(|| Ok(EchoReverse));
+    let arg1 = std::env::args().nth(1);
+    let arg1_ref: Option<&str> = arg1.as_ref().map(String::as_ref);
+
+    match arg1_ref {
+        Some("server") => {
+            let addr = "127.0.0.1:12345".parse().unwrap();
+            println!("Running server on {:?}", addr);
+            let server = TcpServer::new(LineProto, addr);
+            server.serve(|| Ok(EchoReverse));
+        },
+        _ => {
+            println!("usage: {} server", std::env::args().next().unwrap());
+        }
+    }
 }
 
 // implementation for "simple server" tutorial, part 1 (Codec)
