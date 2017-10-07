@@ -1,0 +1,6 @@
+[package]
+name = "arpg_take2"
+version = "0.1.0"
+authors = ["Dylan Halperin <dylan@dylemma.io>"]
+
+[dependencies]
