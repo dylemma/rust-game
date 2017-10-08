@@ -1,0 +1,41 @@
+use bytes::BytesMut;
+use std::io;
+use std::str;
+use tokio_io::codec::{Encoder, Decoder};
+
+pub struct LineCodec;
+
+/// Decoder that grabs all of the bytes up until the first '\n' and interprets them as a UTF-8 String.
+impl Decoder for LineCodec {
+    type Item = String;
+    type Error = io::Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<String>> {
+        if let Some(i) = buf.iter().position(|&b| b == b'\n') {
+            // grab the first `i` bytes of the buffer, modifying the buffer so it starts after those bytes
+            let line = buf.split_to(i);
+
+            // nobody cares about the '\n', so split that away as well
+            buf.split_to(1);
+
+            match str::from_utf8(&line) {
+                Ok(s) => Ok(Some(s.to_string())),
+                Err(_) => Err(io::Error::new(io::ErrorKind::Other, "invalid UTF-8")),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Encoder for line-based messages
+impl Encoder for LineCodec {
+    type Item = String;
+    type Error = io::Error;
+
+    fn encode(&mut self, msg: String, buf: &mut BytesMut) -> io::Result<()> {
+        buf.extend(msg.as_bytes());
+        buf.extend(b"\n");
+        Ok(())
+    }
+}
