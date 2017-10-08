@@ -12,15 +12,12 @@ mod codecs;
 use bytes::BytesMut;
 
 use futures::{future, Future, Stream, Sink};
-use futures::stream;
 use futures::sync::mpsc::{unbounded as stream_channel, UnboundedSender, UnboundedReceiver};
 
 use rand::{Rand, Rng};
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::iter;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::str;
@@ -31,12 +28,11 @@ use std::thread;
 
 use tokio_core::net::TcpListener;
 use tokio_core::reactor::Core;
-use tokio_io::codec::{Encoder, Decoder};
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::codec::Framed;
 use tokio_proto::pipeline::ServerProto;
 use tokio_proto::TcpServer;
-use tokio_service::{Service, NewService};
+use tokio_service::Service;
 
 
 fn main() {
@@ -64,8 +60,6 @@ fn main() {
             let connections: Arc<Mutex<HashMap<usize, Client, _>>> = Arc::new(Mutex::new(HashMap::new()));
 
             let connections_for_broadcast = connections.clone();
-            let connections_for_server = connections.clone();
-
             let broadcast_grid_updates =
                 grid_update_receiver.for_each(move |update| {
                     println!("Broadcast update: {:?}", update);
@@ -73,11 +67,10 @@ fn main() {
                     // send the update to all of the clients
                     let clients = connections_for_broadcast.lock().unwrap();
                     for ref client in clients.values() {
-                        client.sender.unbounded_send(update);
+                        client.sender.unbounded_send(update).unwrap();
                     }
                     future::ok(())
                 });
-            handle.spawn(broadcast_grid_updates);
 
             let server = listener.incoming().for_each(|(socket, peer_addr)| {
                 let mut rng = rand::thread_rng();
@@ -135,29 +128,31 @@ fn main() {
                         } else {
                             println!("failed to de-register the disconnected client :(");
                         }
-                        grid_message_sender.send(GridMessage::Disconnect(player_id));
+                        grid_message_sender.send(GridMessage::Disconnect(player_id)).unwrap();
                     }
                     Ok(())
                 });
 
-//                handle.spawn(handle_messages.map_err(|_| ()));
-
-//                let service = Echo;
-//                let responses = reader.and_then(move |req| service.call(req));
-//                let stuff = writer2.send_all(responses).then(move |_| {
-//                    println!("User '{}' disconnected", player_id);
-//                    Ok(())
-//                });
                 handle.spawn(handle_everything);
                 Ok(())
             });
 
-            core.run(server);
+            let server_and_broadcast = broadcast_grid_updates.map_err(|_| fake_io_error("uh oh")).select(server);
+
+            let x = core.run(server_and_broadcast);
+            match x {
+                Ok(_) => (),
+                Err(_e) => println!("Server crashed!"),
+            }
         }
         _ => {
             println!("usage: {} server", std::env::args().next().unwrap());
         }
     }
+}
+
+fn fake_io_error(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, msg)
 }
 
 struct Client {
@@ -206,10 +201,10 @@ impl Player {
     }
     fn send_state_updates(&mut self, out: &UnboundedSender<GridUpdate>, replay_inits: bool) {
         if self.is_newly_connected || replay_inits {
-            out.unbounded_send(GridUpdate::Connected(self.id, self.pos));
+            out.unbounded_send(GridUpdate::Connected(self.id, self.pos)).unwrap();
         }
         if self.is_modified || replay_inits {
-            out.unbounded_send(GridUpdate::MovedTo(self.id, self.pos));
+            out.unbounded_send(GridUpdate::MovedTo(self.id, self.pos)).unwrap();
         }
         self.is_newly_connected = false;
         self.is_modified = false;
