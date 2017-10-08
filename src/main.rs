@@ -12,6 +12,7 @@ mod codecs;
 use bytes::BytesMut;
 
 use futures::{future, Future, Stream, Sink};
+use futures::stream::{SplitSink, SplitStream};
 use futures::sync::mpsc::{unbounded as stream_channel, UnboundedSender, UnboundedReceiver};
 
 use rand::{Rand, Rng};
@@ -51,7 +52,7 @@ fn main() {
             let handle = core.handle();
             let address = "0.0.0.0:12345".parse().unwrap();
             let listener = TcpListener::bind(&address, &core.handle()).unwrap();
-            let uid_counter = AtomicUsize::new(0);
+            let uid_counter = Rc::new(AtomicUsize::new(0));
             let (mut grid,grid_message_sender,grid_update_receiver) = Grid::new();
             let grid_message_sender = Rc::new(grid_message_sender);
             thread::spawn(move || grid.run());
@@ -70,69 +71,143 @@ fn main() {
                     }
                     future::ok(())
                 });
+//            let boxed_broadcast_future: Box<Future<Item = (), Error = ()>> = Box::new(broadcast_grid_updates);
 
             let server = listener.incoming().for_each(|(socket, peer_addr)| {
                 let mut rng = rand::thread_rng();
-                let uid = uid_counter.fetch_add(1, Ordering::SeqCst) as u64;
+//                let uid = uid_counter.fetch_add(1, Ordering::SeqCst) as u64;
                 let player_name = rng.gen_ascii_chars().next().unwrap();
                 let initial_pos = rng.gen();
                 let (writer, reader) = socket.framed(codecs::GridTextCodec).split();
                 let connections = connections.clone();
-
+                let uid_counter_ref = uid_counter.clone();
                 // channel for outside sources to send messages to the socket
                 let (client_grid_updates, grid_updates) = stream_channel::<GridClientResponse>();
 
-                let client = Client {
-                    uid,
-                    player_name,
-                    addr: peer_addr,
-                    sender: client_grid_updates,
-                };
-                println!("User connected from {} with ID '{}'", peer_addr, player_name);
-
-                // Get a lock on the connections map to insert the newly-connected client.
-                // Use a block scope to ensure the lock drops quickly.
-                {
-                    let mut connections_inner = connections.lock().unwrap();
-                    connections_inner.insert(uid,client);
-                }
-
-                grid_message_sender.send(GridMessage::Connect(uid, player_name, initial_pos)).unwrap();
-
-                let handle_messages = reader.for_each(move |msg| {
-                    let player_name = player_name.clone();
-                    println!("Received message from '{}': {:?}", player_name, msg);
-                    // TODO: handle the message by sending a GridMessage to the `client_grid_updates` channel
-                    future::ok(())
+                let handshake = writer.send(GridClientResponse::LoginPrompt).and_then(move |writer_cont| {
+                    reader.into_future().map_err(|(err, _)| err).and_then(move |(hopefully_login, read_cont)| {
+                        // NOTE: don't return futures from the match - the types end up not being the same,
+                        // and the future combinator stuff just can't handle that.
+                        let login_attempt: io::Result<PlayerName> = match hopefully_login {
+                            Some(GridClientRequest::LoginAs(player_name)) => Ok(player_name),
+                            other => {
+                                println!("Unsuccessful login attempt from {}: {:?}", peer_addr, other);
+                                Err(fake_io_error("Expected login attempt"))
+                            }
+                        };
+                        // send the handshake acknowledgement and return the client+reader+writer triplet
+                        future::result(login_attempt).and_then(move |player_name| {
+                            let uid = uid_counter_ref.fetch_add(1, Ordering::SeqCst) as u64;
+                            println!("Successful login handshake by client {} with name {}", uid, player_name);
+                            let client = Client {
+                                uid,
+                                player_name,
+                                addr: peer_addr,
+                                sender: client_grid_updates,
+                            };
+                            writer_cont.send(GridClientResponse::LoggedIn(uid)).and_then(|writer_cont| {
+                                future::ok((client, writer_cont, read_cont))
+                            })
+                        })
+                    })
                 }).map_err(|_| ());
 
-                let grid_update_strings = grid_updates
-//                    .map(|upd| format!("{:?}", upd) )
-                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "idk lol"));
-                let handle_updates = writer.send_all(grid_update_strings)
-                    .map_err(|_| ())
-                    .map(|_| ());
-
+                // clone the connections Arc so we can move it into the closure
+                let connections_1 = connections.clone();
                 let grid_message_sender = grid_message_sender.clone();
-                let handle_everything = handle_messages.select(handle_updates).then(move |_| {
-                    let player_id = player_name.clone();
-                    println!("User '{}' disconnected", player_id);
-
-                    // remove the client from the clients registry
+                let handle_client = handshake.and_then(move |(client, socket_out, socket_in)| {
+                    let Client{ uid, player_name, .. } = client;
+                    // Register the client in the "connections" map.
+                    //  - Get a lock on the connections map to insert the newly-connected client.
+                    //  - Use a block scope to ensure the lock drops quickly.
                     {
-                        let mut connections_inner = connections.lock().unwrap();
-                        let removed = connections_inner.remove(&uid);
-                        if removed.is_some() {
-                            println!("successfully de-registered the disconnected client");
-                        } else {
-                            println!("failed to de-register the disconnected client :(");
-                        }
-                        grid_message_sender.send(GridMessage::Disconnect(uid)).unwrap();
+                        let mut connections_inner = connections_1.lock().unwrap();
+                        connections_inner.insert(uid,client);
                     }
-                    Ok(())
+
+                    // Notify the Grid of the new player
+                    grid_message_sender.send(GridMessage::Connect(uid, player_name, initial_pos)).unwrap();
+
+                    // A Future that handles every message coming from the client's socket.
+                    // The Future type should have `()` for both Item and Error.
+                    let handle_incoming = socket_in
+                        .for_each(move |msg| {
+                            println!("Received message from {} - {:?}", uid, msg);
+                            // TODO: handle the message by sending a GridMessage to the `client_grid_updates` channel
+                            future::ok(())
+                        })
+                        .map_err(|_| ());
+
+                    // A stream representing the messages sent to the client from external sources.
+                    // The `send_all` method (used later) wants the Stream to have Error=io::Error, so we map it from ()
+                    let outgoing_messages = grid_updates
+                        .map_err(|_| fake_io_error("Error receiving broadcast message"));
+
+                    // A Future that handles every message being sent to the client's socket.
+                    // Future Future type should have `()` as both Item and Error.
+                    let handle_outgoing = socket_out
+                        .send_all(outgoing_messages)
+                        .map(|_| ())
+                        .map_err(|_| ());
+
+                    // A future combining `handle_incoming` and `handle_outgoing`.
+                    // This will complete when either of the two parts complete, i.e. when the client disconnects.
+                    let handle_io = handle_incoming.select(handle_outgoing);
+
+                    // Make sure to de-register the client once the IO is finished (i.e. disconnected)
+                    // This Future will be the return for this closure, representing the entire client lifecycle.
+                    handle_io.then(move |_| {
+                        {
+                            let mut connections_inner = connections.lock().unwrap();
+                            let removed = connections_inner.remove(&uid);
+                            if removed.is_some() {
+                                println!("successfully de-registered the disconnected client");
+                            } else {
+                                println!("failed to de-register the disconnected client :(");
+                            }
+                            grid_message_sender.send(GridMessage::Disconnect(uid)).unwrap();
+                        }
+                        Ok(())
+                    })
                 });
 
-                handle.spawn(handle_everything);
+//                let boxed_handle_client: Box<Future<Item = (), Error = ()>> = Box::new(handle_client);
+
+//                let handle_messages = reader.for_each(move |msg| {
+//                    let player_name = player_name.clone();
+//                    println!("Received message from '{}': {:?}", player_name, msg);
+//                    // TODO: handle the message by sending a GridMessage to the `client_grid_updates` channel
+//                    future::ok(())
+//                }).map_err(|_| ());
+//
+//                let grid_update_strings = grid_updates
+////                    .map(|upd| format!("{:?}", upd) )
+//                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "idk lol"));
+//                let handle_updates = writer.send_all(grid_update_strings)
+//                    .map_err(|_| ())
+//                    .map(|_| ());
+//
+//                let grid_message_sender = grid_message_sender.clone();
+//                let handle_everything = handle_messages.select(handle_updates).then(move |_| {
+//                    let player_id = player_name.clone();
+//                    println!("User '{}' disconnected", player_id);
+//
+//                    // remove the client from the clients registry
+//                    {
+//                        let mut connections_inner = connections.lock().unwrap();
+//                        let removed = connections_inner.remove(&uid);
+//                        if removed.is_some() {
+//                            println!("successfully de-registered the disconnected client");
+//                        } else {
+//                            println!("failed to de-register the disconnected client :(");
+//                        }
+//                        grid_message_sender.send(GridMessage::Disconnect(uid)).unwrap();
+//                    }
+//                    Ok(())
+//                });
+
+//                handle.spawn(handle_everything);
+                handle.spawn(handle_client);
                 Ok(())
             });
 
@@ -222,6 +297,7 @@ pub enum GridClientRequest {
 
 #[derive(Debug, Clone, Copy)]
 pub enum GridClientResponse {
+    LoginPrompt,
     LoggedIn(PlayerUid),
     GridUpdated(GridUpdate),
     BadRequest,
