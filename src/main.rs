@@ -56,8 +56,7 @@ fn main() {
             let grid_message_sender = Rc::new(grid_message_sender);
             thread::spawn(move || grid.run());
 
-//            let connections = Rc::new(RefCell::new(HashMap::new()));
-            let connections: Arc<Mutex<HashMap<usize, Client, _>>> = Arc::new(Mutex::new(HashMap::new()));
+            let connections: Arc<Mutex<HashMap<u64, Client, _>>> = Arc::new(Mutex::new(HashMap::new()));
 
             let connections_for_broadcast = connections.clone();
             let broadcast_grid_updates =
@@ -66,49 +65,49 @@ fn main() {
 
                     // send the update to all of the clients
                     let clients = connections_for_broadcast.lock().unwrap();
-                    for ref client in clients.values() {
-                        client.sender.unbounded_send(update).unwrap();
+                    for client in clients.values() {
+                        client.sender.unbounded_send(GridClientResponse::GridUpdated(update)).unwrap();
                     }
                     future::ok(())
                 });
 
             let server = listener.incoming().for_each(|(socket, peer_addr)| {
                 let mut rng = rand::thread_rng();
-                let uid = uid_counter.fetch_add(1, Ordering::SeqCst);
-                let player_id = rng.gen_ascii_chars().next().unwrap();
+                let uid = uid_counter.fetch_add(1, Ordering::SeqCst) as u64;
+                let player_name = rng.gen_ascii_chars().next().unwrap();
                 let initial_pos = rng.gen();
-                let (writer, reader) = socket.framed(codecs::LineCodec).split();
+                let (writer, reader) = socket.framed(codecs::GridTextCodec).split();
                 let connections = connections.clone();
 
                 // channel for outside sources to send messages to the socket
-                let (client_grid_updates, grid_updates) = stream_channel::<GridUpdate>();
+                let (client_grid_updates, grid_updates) = stream_channel::<GridClientResponse>();
 
                 let client = Client {
                     uid,
-                    player_id,
+                    player_name,
                     addr: peer_addr,
                     sender: client_grid_updates,
                 };
-//                let player_id = player_id_gen.next().unwrap();
-                println!("User connected from {} with ID '{}'", peer_addr, player_id);
-                //
+                println!("User connected from {} with ID '{}'", peer_addr, player_name);
+
+                // Get a lock on the connections map to insert the newly-connected client.
+                // Use a block scope to ensure the lock drops quickly.
                 {
                     let mut connections_inner = connections.lock().unwrap();
                     connections_inner.insert(uid,client);
                 }
-//                let (t_send, t_recv) = futures::sync::mpsc::unbounded();
 
-                grid_message_sender.send(GridMessage::Connect(player_id, initial_pos)).unwrap();
+                grid_message_sender.send(GridMessage::Connect(uid, player_name, initial_pos)).unwrap();
 
                 let handle_messages = reader.for_each(move |msg| {
-                    let player_id = player_id.clone();
-                    println!("Received message from '{}': {}", player_id, msg);
+                    let player_name = player_name.clone();
+                    println!("Received message from '{}': {:?}", player_name, msg);
                     // TODO: handle the message by sending a GridMessage to the `client_grid_updates` channel
                     future::ok(())
                 }).map_err(|_| ());
 
                 let grid_update_strings = grid_updates
-                    .map(|upd| format!("{:?}", upd) )
+//                    .map(|upd| format!("{:?}", upd) )
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "idk lol"));
                 let handle_updates = writer.send_all(grid_update_strings)
                     .map_err(|_| ())
@@ -116,7 +115,7 @@ fn main() {
 
                 let grid_message_sender = grid_message_sender.clone();
                 let handle_everything = handle_messages.select(handle_updates).then(move |_| {
-                    let player_id = player_id.clone();
+                    let player_id = player_name.clone();
                     println!("User '{}' disconnected", player_id);
 
                     // remove the client from the clients registry
@@ -128,7 +127,7 @@ fn main() {
                         } else {
                             println!("failed to de-register the disconnected client :(");
                         }
-                        grid_message_sender.send(GridMessage::Disconnect(player_id)).unwrap();
+                        grid_message_sender.send(GridMessage::Disconnect(uid)).unwrap();
                     }
                     Ok(())
                 });
@@ -156,10 +155,10 @@ fn fake_io_error(msg: &str) -> io::Error {
 }
 
 struct Client {
-    uid: usize,
-    player_id: char,
+    uid: PlayerUid,
+    player_name: PlayerName,
     addr: SocketAddr,
-    sender: UnboundedSender<GridUpdate>
+    sender: UnboundedSender<GridClientResponse>
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,18 +177,21 @@ impl Rand for GridPoint {
     }
 }
 
-type PlayerId = char;
+type PlayerName = char;
+type PlayerUid = u64;
 
 struct Player {
-    id: PlayerId,
+    id: PlayerUid,
+    name: PlayerName,
     pos: GridPoint,
     is_newly_connected: bool,
     is_modified: bool,
 }
 impl Player {
-    fn new(id: PlayerId, pos: GridPoint) -> Player {
+    fn new(id: PlayerUid, name: PlayerName, pos: GridPoint) -> Player {
         Player {
             id,
+            name,
             pos,
             is_newly_connected: true,
             is_modified: false,
@@ -201,7 +203,7 @@ impl Player {
     }
     fn send_state_updates(&mut self, out: &UnboundedSender<GridUpdate>, replay_inits: bool) {
         if self.is_newly_connected || replay_inits {
-            out.unbounded_send(GridUpdate::Connected(self.id, self.pos)).unwrap();
+            out.unbounded_send(GridUpdate::Connected(self.id, self.name,self.pos)).unwrap();
         }
         if self.is_modified || replay_inits {
             out.unbounded_send(GridUpdate::MovedTo(self.id, self.pos)).unwrap();
@@ -212,17 +214,31 @@ impl Player {
 }
 
 #[derive(Debug)]
-enum GridMessage {
-    Connect(PlayerId, GridPoint),
-    Disconnect(PlayerId),
-    MoveRel(PlayerId, GridPoint),
+pub enum GridClientRequest {
+    LoginAs(PlayerName),
+    MoveRel(GridPoint),
+    Unrecognized(String),
 }
 
 #[derive(Debug, Clone, Copy)]
-enum GridUpdate {
-    Connected(PlayerId, GridPoint),
-    MovedTo(PlayerId, GridPoint),
-    Disconnected(PlayerId),
+pub enum GridClientResponse {
+    LoggedIn(PlayerUid),
+    GridUpdated(GridUpdate),
+    BadRequest,
+}
+
+#[derive(Debug)]
+enum GridMessage {
+    Connect(PlayerUid, PlayerName, GridPoint),
+    Disconnect(PlayerUid),
+    MoveRel(PlayerUid, GridPoint),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GridUpdate {
+    Connected(PlayerUid, PlayerName, GridPoint),
+    MovedTo(PlayerUid, GridPoint),
+    Disconnected(PlayerUid),
 }
 
 struct Grid {
@@ -249,8 +265,8 @@ impl Grid {
             event_buf.extend(self.incoming.try_iter());
             for event in event_buf.iter() {
                 match *event {
-                    GridMessage::Connect(id, pos) => {
-                        let player = Player::new(id, pos);
+                    GridMessage::Connect(id, name, pos) => {
+                        let player = Player::new(id, name,pos);
                         self.players.push(player);
                     },
                     GridMessage::Disconnect(id) => {
@@ -274,84 +290,6 @@ impl Grid {
 }
 
 
-//mod direction {
-//    use ::GridPoint;
-//    pub const UP: GridPoint = GridPoint(0, -1);
-//    pub const DOWN: GridPoint = GridPoint(0, 1);
-//    pub const LEFT: GridPoint = GridPoint(-1, 0);
-//    pub const RIGHT: GridPoint = GridPoint(1, 0);
-//}
-
-//pub struct GridCodec;
-
-//impl Decoder for GridCodec {
-//    type Item = Result<GridRequest, String>;
-//    type Error = io::Error;
-//
-//    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Self::Item> {
-//        LineCodec.decode(buf).map(|line| {
-//            let line_ref: Option<&str> = line.as_ref().map(String::as_ref);
-//            match line_ref {
-//                Some("up") => Ok(GridRequest::MoveRel(direction::UP)),
-//                Some("down") => Ok(GridRequest::MoveRel(direction::DOWN)),
-//                Some("left") => Ok(GridRequest::MoveRel(direction::LEFT)),
-//                Some("right") => Ok(GridRequest::MoveRel(direction::RIGHT)),
-//                Some(s) => Err(s),
-//                None => None,
-//            }
-//        })
-//    }
-//}
-//impl Encoder for GridCodec {
-//    type Item = GridResponse;
-//    type Error = io::Error;
-//
-//    fn encode(&mut self, item: Self::Item, buf: &mut BytesMut) -> Result<(), Self::Error> {
-//        match item {
-//            GridResponse::Ack => buf.extend(b"ok"),
-//            GridResponse::NoAck => buf.extend(b"invalid"),
-//        }
-//        buf.extend(b"\n");
-//        Ok(())
-//    }
-//}
-
-//pub struct GridProto;
-//
-//impl <T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for GridProto {
-//    type Request = Result<GridRequest, String>;
-//    type Response = GridResponse;
-//    type Transport = Framed<T, GridCodec>;
-//    type BindTransport = Result<Self::Transport, io::Error>;
-//    fn bind_transport(&self, io: T) -> Self::BindTransport {
-//        let transport = io.framed(GridCodec);
-//
-//        Box::new(transport.into_future()
-//            .map_err(|(e, _)| e)
-//            .and_then(|(line, transport)| {
-//
-//            })
-//        )
-////        Ok(io.framed(GridCodec))
-//    }
-//}
-
-//pub struct GridService;
-//impl Service for GridService {
-//    type Request = Result<GridRequest, String>;
-//    type Response = GridResponse;
-//    type Error = io::Error;
-//    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
-//
-//    fn call(&self, req: Self::Request) -> Self::Future {
-//        let response = match req {
-//            Ok(request) => {
-//
-//            }
-//        }
-//        unimplemented!()
-//    }
-//}
 
 // implementation for "simple server" tutorial, part 1 (Codec)
 
@@ -375,9 +313,6 @@ impl <T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for LineProto {
 }
 
 
-// implementation for "simple server" tutorial, part 3 (Service)
-
-/// The echo "service". Doesn't actually hold data since it's a stateless echo server.
 pub struct Echo;
 
 impl Service for Echo {

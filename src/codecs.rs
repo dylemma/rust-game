@@ -3,6 +3,8 @@ use std::io;
 use std::str;
 use tokio_io::codec::{Encoder, Decoder};
 
+use super::{GridClientRequest, GridClientResponse, GridPoint, PlayerUid};
+
 pub struct LineCodec;
 
 /// Decoder that grabs all of the bytes up until the first '\n' and interprets them as a UTF-8 String.
@@ -37,5 +39,43 @@ impl Encoder for LineCodec {
         buf.extend(msg.as_bytes());
         buf.extend(b"\n");
         Ok(())
+    }
+}
+
+pub struct GridTextCodec;
+
+impl Decoder for GridTextCodec {
+    type Item = GridClientRequest;
+    type Error = io::Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        LineCodec.decode(buf).map(|line_opt| line_opt.map(|line| {
+            let line = line.trim_right();
+
+            if line.starts_with("login:") {
+                if let Some(player_name) = line.chars().nth(6) {
+                    return GridClientRequest::LoginAs(player_name);
+                }
+            }
+
+            match line {
+                "up" => return GridClientRequest::MoveRel(GridPoint(0, -1)),
+                "down" => return GridClientRequest::MoveRel(GridPoint(0, 1)),
+                "left" => return GridClientRequest::MoveRel(GridPoint(-1, 0)),
+                "right" => return GridClientRequest::MoveRel(GridPoint(1, 0)),
+                _ => ()
+            }
+
+            GridClientRequest::Unrecognized(line.to_string())
+        }))
+    }
+}
+
+impl Encoder for GridTextCodec {
+    type Item = GridClientResponse;
+    type Error = io::Error;
+
+    fn encode(&mut self, item: Self::Item, buf: &mut BytesMut) -> Result<(), Self::Error> {
+        LineCodec.encode(format!("{:?}", item), buf)
     }
 }
