@@ -1,9 +1,31 @@
+use game::*;
+
 use bytes::BytesMut;
 use std::io;
 use std::str;
 use tokio_io::codec::{Encoder, Decoder};
 
-use super::{GridClientRequest, GridClientResponse, GridPoint};
+#[derive(Debug)]
+pub enum GridClientRequest {
+    LoginAs(PlayerName),
+    MoveRel(GridPoint),
+    Unrecognized(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GridClientResponse {
+    LoginPrompt,
+    LoggedIn(PlayerUid),
+    GridUpdated(GridUpdate),
+    Hangup(GridServerHangup),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GridServerHangup {
+    UnexpectedLogin,
+    UnrecognizedRequest,
+    InternalError
+}
 
 pub struct LineCodec;
 
