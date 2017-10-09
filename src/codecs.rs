@@ -3,7 +3,7 @@ use std::io;
 use std::str;
 use tokio_io::codec::{Encoder, Decoder};
 
-use super::{GridClientRequest, GridClientResponse, GridPoint, PlayerUid};
+use super::{GridClientRequest, GridClientResponse, GridPoint};
 
 pub struct LineCodec;
 

@@ -10,7 +10,6 @@ extern crate tokio_service;
 mod codecs;
 
 use futures::{future, Future, Stream, Sink};
-use futures::stream::{SplitSink, SplitStream};
 use futures::sync::mpsc::{unbounded as stream_channel, UnboundedSender, UnboundedReceiver};
 
 use rand::{Rand, Rng};
@@ -57,29 +56,25 @@ fn main() {
 
             let mut handshake = ClientHandshake::new();
 
-            let connections: Arc<Mutex<HashMap<u64, Client, _>>> = Arc::new(Mutex::new(HashMap::new()));
+            let client_registry = ClientRegistry::new();
 
-            let connections_for_broadcast = connections.clone();
+            let client_registry_capture1 = client_registry.clone();
             let broadcast_grid_updates =
                 grid_update_receiver.for_each(move |update| {
                     println!("Broadcast update: {:?}", update);
-
                     // send the update to all of the clients
-                    let clients = connections_for_broadcast.lock().unwrap();
-                    for client in clients.values() {
-                        client.sender.unbounded_send(GridClientResponse::GridUpdated(update)).unwrap();
-                    }
+                    client_registry_capture1.broadcast(GridClientResponse::GridUpdated(update));
                     future::ok(())
                 });
 
+            let client_registry_capture2 = client_registry.clone();
             let server = listener.incoming().for_each(|(socket, peer_addr)| {
                 // capture/clone the grid_message_sender from the grid itself
                 let server_grid_message_sender = outer_grid_message_sender.clone();
 
                 let mut rng = rand::thread_rng();
-                let player_name = rng.gen_ascii_chars().next().unwrap();
                 let initial_pos = rng.gen();
-                let connections = connections.clone();
+//                let connections = connections.clone();
                 // channel for outside sources to send messages to the socket
                 let (client_grid_updates, grid_updates) = stream_channel::<GridClientResponse>();
 
@@ -88,7 +83,7 @@ fn main() {
                     let (writer, reader) = io.split();
                     let client = Client {
                         uid,
-                        player_name,
+                        player_name: name,
                         addr: peer_addr,
                         sender: Rc::new(client_grid_updates),
                     };
@@ -96,23 +91,17 @@ fn main() {
                 });
 
                 // clone the connections Arc so we can move it into the closure
-                let connections_1 = connections.clone();
+                let client_registry_capture3 = client_registry_capture2.clone();
                 // clone the grid_message_sender Rc so we can move it into the closure
                 let client_grid_message_sender = server_grid_message_sender.clone();
                 let handle_client = handshake.and_then(move |(client, socket_out, socket_in)| {
                     let Client{ uid, player_name, .. } = client;
                     let responder = client.sender.clone();
                     // Register the client in the "connections" map.
-                    //  - Get a lock on the connections map to insert the newly-connected client.
-                    //  - Use a block scope to ensure the lock drops quickly.
-                    {
-                        let mut connections_inner = connections_1.lock().unwrap();
-                        connections_inner.insert(uid,client);
-                    }
+                    client_registry_capture3.register(client);
 
                     // Notify the Grid of the new player
                     client_grid_message_sender.send(GridMessage::Connect(uid, player_name, initial_pos)).unwrap();
-
 
                     // clone the client_grid_message_sender to capture in the responses_or_hangups closure
                     let grid_sender_for_incoming = client_grid_message_sender.clone();
@@ -145,7 +134,7 @@ fn main() {
                                 }
                             }
                         })
-                        .map_err(|err| ());
+                        .map_err(|_| ());
 
                     // A stream representing the messages sent to the client from external sources.
                     // The `send_all` method (used later) wants the Stream to have Error=io::Error, so we map it from ()
@@ -168,17 +157,15 @@ fn main() {
 
                     // Make sure to de-register the client once the IO is finished (i.e. disconnected)
                     // This Future will be the return for this closure, representing the entire client lifecycle.
+                    let client_registry_capture4 = client_registry_capture3.clone();
                     handle_io.then(move |_| {
-                        {
-                            let mut connections_inner = connections.lock().unwrap();
-                            let removed = connections_inner.remove(&uid);
-                            if removed.is_some() {
-                                println!("successfully de-registered the disconnected client");
-                            } else {
-                                println!("failed to de-register the disconnected client :(");
-                            }
-                            disconnect_message_sender.send(GridMessage::Disconnect(uid)).unwrap();
+                        let removed = client_registry_capture4.remove(&uid);
+                        if removed.is_some() {
+                            println!("successfully de-registered the disconnected client");
+                        } else {
+                            println!("failed to de-register the disconnected client :(");
                         }
+                        disconnect_message_sender.send(GridMessage::Disconnect(uid)).unwrap();
                         Ok(())
                     })
                 });
@@ -409,8 +396,30 @@ impl ClientHandshake {
     }
 }
 
-
-// implementation for "simple server" tutorial, part 1 (Codec)
+#[derive(Clone)]
+struct ClientRegistry {
+    inner: Arc<Mutex<HashMap<PlayerUid, Client, RandomState>>>,
+}
+impl ClientRegistry {
+    fn new() -> Self {
+        ClientRegistry { inner: Arc::new(Mutex::new(HashMap::new())) }
+    }
+    fn register(&self, client: Client) {
+        let uid = client.uid;
+        let mut clients = self.inner.lock().unwrap();
+        clients.insert(uid,client);
+    }
+    fn remove(&self, uid: &PlayerUid) -> Option<Client> {
+        let mut clients = self.inner.lock().unwrap();
+        clients.remove(&uid)
+    }
+    fn broadcast(&self, msg: GridClientResponse) {
+        let clients = self.inner.lock().unwrap();
+        for client in clients.values() {
+            client.sender.unbounded_send(msg).unwrap();
+        }
+    }
+}
 
 // implementation for "simple server" tutorial, part 2 (Protocol)
 pub struct LineProto;
