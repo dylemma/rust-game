@@ -4,8 +4,6 @@ extern crate futures;
 extern crate rand;
 extern crate tokio_core;
 extern crate tokio_io;
-extern crate tokio_proto;
-extern crate tokio_service;
 
 mod codecs;
 
@@ -30,9 +28,6 @@ use tokio_core::net::TcpListener;
 use tokio_core::reactor::Core;
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::codec::{Encoder, Decoder, Framed};
-use tokio_proto::pipeline::ServerProto;
-use tokio_proto::TcpServer;
-use tokio_service::Service;
 
 
 fn main() {
@@ -40,64 +35,98 @@ fn main() {
     let arg1_ref: Option<&str> = arg1.as_ref().map(String::as_ref);
 
     match arg1_ref {
-        Some("server") => {
-            let addr = "127.0.0.1:12345".parse().unwrap();
-            println!("Running server on {:?}", addr);
-            let server = TcpServer::new(LineProto, addr);
-            server.serve(|| Ok(EchoReverse));
-        },
-        Some("server2") => {
-            let mut core = Core::new().unwrap();
-            let handle = core.handle();
-            let address = "0.0.0.0:12345".parse().unwrap();
-            let listener = TcpListener::bind(&address, &core.handle()).unwrap();
-            let (mut grid, grid_inbox,grid_broadcast) = Grid::new();
-            thread::spawn(move || grid.run());
+        Some("server") => server_main(),
+        Some("client") => println!("TODO"),
+        _ => println!("Argument should be either 'server' or 'client'"),
+    }
+}
 
-            let client_registry = ClientRegistry::new();
+fn server_main() {
+    // The event loop that deals with all of the async IO we want to do
+    let mut core = Core::new().unwrap();
+    let handle = core.handle();
 
-            let server_handle = GridServerHandle {
-                clients: client_registry.clone(),
-                grid_inbox: grid_inbox.clone(),
-            };
+    // Set up a TCP listener that will accept new connections
+    let address = "0.0.0.0:12345".parse().unwrap();
+    let listener = TcpListener::bind(&address, &core.handle()).unwrap();
 
-            let mut handshake = ClientHandshake::new();
+    // Create a new `Grid` (a.k.a. the game world).
+    // This gets us:
+    //  - the actual `Grid`
+    //  - a handle to send messages to the Grid (like user inputs)
+    //  - a stream of game state updates which needs to be read
+    let (mut grid, grid_inbox,grid_broadcast) = Grid::new();
 
-            let client_registry_capture1 = client_registry.clone();
-            let consume_grid_broadcast =
-                grid_broadcast.for_each(move |update| {
-                    println!("Broadcast update: {:?}", update);
-                    // send the update to all of the clients
-                    client_registry_capture1.broadcast(GridClientResponse::GridUpdated(update));
-                    future::ok(())
-                });
+    // Run the game loop in a dedicated thread
+    thread::spawn(move || grid.run());
 
-            let server = listener.incoming().for_each(|(socket, peer_addr)| {
+    // Whenever the game updates, we want to tell all connected clients about it.
+    // This is a collection of client handles which can be used to do just that.
+    // The server will add and remove entries from this registry as clients
+    // connect and disconnect.
+    let client_registry = ClientRegistry::new();
 
-                // clone the server handle to be captured in the following closure
-                let server_handle = server_handle.clone();
+    // A lightweight reference to the game state.
+    // This also acts as the client handler thanks to its IOService implementation.
+    // Each client that connects will be handled by this (or a clone of it).
+    let server_handle = GridServerHandle {
+        clients: client_registry.clone(),
+        grid_inbox: grid_inbox.clone(),
+    };
 
-                // run the handshake and pass its result along to the `server_handle` to get a Future representing the completed handling of the client
-                let handle_client = handshake.call(socket, peer_addr, codecs::GridTextCodec).and_then(move |(handshake_out, io)| {
-                    server_handle.handle_client(handshake_out, io)
-                });
+    // A struct representing the handshake process that each client must go through
+    // in order to really connect and start interacting with the game.
+    let mut handshake = ClientHandshake::new();
 
-                // now run the client handler in the event loop
-                handle.spawn(handle_client);
-                Ok(())
-            });
+    // A Future which pulls messages from the `grid_broadcast` and sends them
+    // to all connected clients.
+    //
+    // This Future should never complete on its own, barring a `panic!`
+    //
+    // NOTE: this doesn't actually do anything when we declare it.
+    // It needs to be passed along to `core.run` (which we do indirectly by first
+    // combining it with another Future and *then* passing it).
+    let consume_grid_broadcast = {
+        let client_registry = client_registry.clone();
+        grid_broadcast.for_each(move |update| {
+            println!("Broadcast update: {:?}", update);
+            // send the update to all of the clients
+            client_registry.broadcast(GridClientResponse::GridUpdated(update));
+            future::ok(())
+        })
+    };
 
-            let server_and_broadcast = consume_grid_broadcast.map_err(|_| fake_io_error("uh oh")).select(server);
+    // A Future which handles all incoming TCP connections on our particular port.
+    // For each new connection, it runs the handshake and, if successfull, spawns
+    // a new handler task (which runs on the `core` event loop) to manage the connection.
+    //
+    // This Future should never complete on its own, barring a `panic!`
+    let server = listener.incoming().for_each(|(socket, peer_addr)| {
 
-            let x = core.run(server_and_broadcast);
-            match x {
-                Ok(_) => (),
-                Err(_e) => println!("Server crashed!"),
-            }
-        }
-        _ => {
-            println!("usage: {} server", std::env::args().next().unwrap());
-        }
+        // clone the server handle to be captured in the following closure
+        let server_handle = server_handle.clone();
+
+        // run the handshake and pass its result along to the `server_handle` to get a Future representing the completed handling of the client
+        let handle_client = handshake.call(socket, peer_addr, codecs::GridTextCodec).and_then(move |(handshake_out, io)| {
+            server_handle.handle_client(handshake_out, io)
+        });
+
+        // now run the client handler in the event loop
+        handle.spawn(handle_client);
+        Ok(())
+    });
+
+    // Combination of the grid_broadcast and connection handlers as a single Future which completes
+    // when either of the two either complete or fail.
+    let server_and_broadcast = consume_grid_broadcast.map_err(|_| fake_io_error("uh oh")).select(server);
+
+    // Actually run the two futures defined above.
+    // This will block forever, ideally, since the futures are designed not to complete.
+    // If it does stop, it's effectively a server crash.
+    let x = core.run(server_and_broadcast);
+    match x {
+        Ok(_) => (),
+        Err(_e) => println!("Server crashed!"),
     }
 }
 
@@ -570,54 +599,4 @@ impl <T, C> IOService<T, C> for GridServerHandle
         Box::new(future::result(notified_grid_result))
     }
 
-}
-
-// implementation for "simple server" tutorial, part 2 (Protocol)
-pub struct LineProto;
-
-impl <T: AsyncRead + AsyncWrite + 'static> ServerProto<T> for LineProto {
-    // Decoder::Item
-    type Request = String;
-
-    // Encoder::Item
-    type Response = String;
-
-    // boilerplate / magic
-    type Transport = Framed<T, codecs::LineCodec>;
-    type BindTransport = Result<Self::Transport, io::Error>;
-
-    fn bind_transport(&self, io: T) -> Self::BindTransport {
-        Ok(io.framed(codecs::LineCodec))
-    }
-}
-
-
-pub struct Echo;
-
-impl Service for Echo {
-    // request/response types must correspond to the  protocol types
-    type Request = String;
-    type Response = String;
-
-    // tutorial says: For non-streaming protocols, service errors are always io::Error
-    type Error = io::Error;
-
-    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
-    // compute a future of the response. No actual IO needed, so just use future::ok
-    fn call(&self, req: Self::Request) -> Self::Future {
-        Box::new(future::ok(req))
-    }
-}
-
-pub struct EchoReverse;
-
-impl Service for EchoReverse {
-    type Request = String;
-    type Response = String;
-    type Error = io::Error;
-    type Future = Box<Future<Item = String, Error = io::Error>>;
-    fn call(&self, req: Self::Request) -> Self::Future {
-        let rev: String = req.chars().rev().collect();
-        Box::new(future::ok(rev))
-    }
 }
