@@ -56,13 +56,12 @@ fn main() {
 
             let client_registry = ClientRegistry::new();
 
-            let server_stuff = ServerStuff {
+            let server_handle = GridServerHandle {
                 clients: client_registry.clone(),
                 grid_inbox: grid_inbox.clone(),
             };
 
             let mut handshake = ClientHandshake::new();
-
 
             let client_registry_capture1 = client_registry.clone();
             let consume_grid_broadcast =
@@ -73,110 +72,17 @@ fn main() {
                     future::ok(())
                 });
 
-            let client_registry_capture2 = client_registry.clone();
             let server = listener.incoming().for_each(|(socket, peer_addr)| {
-                // capture/clone the grid_message_sender from the grid itself
-                let server_grid_message_sender = grid_inbox.clone();
 
-                let mut rng = rand::thread_rng();
-//                let initial_pos = rng.gen();
-//                let connections = connections.clone();
+                // clone the server handle to be captured in the following closure
+                let server_handle = server_handle.clone();
 
-                let server_stuff = server_stuff.clone();
+                // run the handshake and pass its result along to the `server_handle` to get a Future representing the completed handling of the client
                 let handle_client = handshake.call(socket, peer_addr, codecs::GridTextCodec).and_then(move |(handshake_out, io)| {
-                    server_stuff.handle_client(handshake_out, io)
+                    server_handle.handle_client(handshake_out, io)
                 });
 
-//                let handshake = handshake.call(socket, peer_addr, codecs::GridTextCodec).and_then(move |(handshake_out, io)| {
-//                    let ClientHandshakeOut{ uid, name, addr } = handshake_out;
-//
-//                    let (client, client_broadcast) = Client::new(uid, name, addr);
-//
-//                    future::ok((client, io, client_broadcast))
-//                });
-
-                // clone the connections Arc so we can move it into the closure
-//                let client_registry_capture3 = client_registry_capture2.clone();
-//                // clone the grid_message_sender Rc so we can move it into the closure
-//                let client_grid_message_sender = server_grid_message_sender.clone();
-//                let handle_client = handshake.and_then(move |(client, io, client_broadcast)| {
-//                    let Client{ uid, name, .. } = client;
-//                    let socket_out = io.writer;
-//                    let socket_in = io.reader;
-//                    let client_inbox = client.inbox.clone();
-//                    // Register the client in the "connections" map.
-//                    client_registry_capture3.register(&client);
-//
-//                    // Notify the Grid of the new player
-//                    client_grid_message_sender.send(GridMessage::Connect(uid, name, initial_pos)).unwrap();
-//
-//                    // clone the client_grid_message_sender to capture in the responses_or_hangups closure
-//                    let grid_sender_for_incoming = client_grid_message_sender.clone();
-//
-//                    // A Future that handles every message coming from the client's socket.
-//                    // The Future type should have `()` for both Item and Error.
-//                    let handle_incoming = socket_in
-//                        .for_each(move |msg| {
-//                            println!("Received message from {} - {:?}", uid, msg);
-//                            let action: Result<GridMessage, GridServerHangup> = match msg {
-//                                GridClientRequest::LoginAs(_) => Err(GridServerHangup::UnexpectedLogin),
-//                                GridClientRequest::Unrecognized(_) => Err(GridServerHangup::UnrecognizedRequest),
-//                                GridClientRequest::MoveRel(d_pos) => Ok(GridMessage::MoveRel(uid, d_pos)),
-//                            };
-//
-//                            match action {
-//                                Ok(grid_msg) => {
-//                                    let send_result = grid_sender_for_incoming
-//                                        .send(grid_msg)
-//                                        .map_err(|_| {
-//                                            client_inbox.push(GridClientResponse::Hangup(GridServerHangup::InternalError));
-//                                            fake_io_error("Hangup after failure to send grid message")
-//                                        });
-//                                    future::result(send_result)
-//                                },
-//                                Err(hangup) => {
-//                                    println!("About to hang up on client {} because: {:?}", uid, hangup);
-//                                    client_inbox.push(GridClientResponse::Hangup(hangup));
-//                                    future::err(fake_io_error("Hangup on misbehaving client"))
-//                                }
-//                            }
-//                        })
-//                        .map_err(|_| ());
-//
-//                    // A stream representing the messages sent to the client from external sources.
-//                    // The `send_all` method (used later) wants the Stream to have Error=io::Error, so we map it from ()
-//                    let outgoing_messages = client_broadcast
-//                        .map_err(|_| fake_io_error("Error receiving broadcast message"));
-//
-//                    // A Future that handles every message being sent to the client's socket.
-//                    // Future Future type should have `()` as both Item and Error.
-//                    let handle_outgoing = socket_out
-//                        .send_all(outgoing_messages)
-//                        .map(|_| ())
-//                        .map_err(|_| ());
-//
-//                    // A future combining `handle_incoming` and `handle_outgoing`.
-//                    // This will complete when either of the two parts complete, i.e. when the client disconnects.
-//                    let handle_io = handle_incoming.select(handle_outgoing).map(|(_first_result, _other_future)| ());
-//
-//                    // capture client_grid_message_sender again for the handle_io.then closure
-//                    let disconnect_message_sender = client_grid_message_sender.clone();
-//
-//                    // Make sure to de-register the client once the IO is finished (i.e. disconnected)
-//                    // This Future will be the return for this closure, representing the entire client lifecycle.
-//                    let client_registry_capture4 = client_registry_capture3.clone();
-//                    handle_io.then(move |_| {
-//                        let removed = client_registry_capture4.remove(&uid);
-//                        if removed.is_some() {
-//                            println!("successfully de-registered the disconnected client");
-//                        } else {
-//                            println!("failed to de-register the disconnected client :(");
-//                        }
-//                        disconnect_message_sender.send(GridMessage::Disconnect(uid)).unwrap();
-//                        Ok(())
-//                    })
-//                });
-//
+                // now run the client handler in the event loop
                 handle.spawn(handle_client);
                 Ok(())
             });
@@ -499,35 +405,51 @@ impl ClientRegistry {
     }
     fn broadcast(&self, msg: GridClientResponse) {
         let clients = self.inner.lock().unwrap();
-        for (uid, inbox) in clients.iter() {
-            println!("broadcasting {:?} to client {}", msg, uid);
+        for inbox in clients.values() {
             inbox.push(msg);
         }
     }
 }
 
-#[derive(Clone)]
-struct ServerStuff {
-    clients: ClientRegistry,
-    grid_inbox: GridInbox,
-}
 
-impl ServerStuff {
-    fn handle_client<T, C>(&self, handshake_result: ClientHandshakeOut, io: ClientIO<T, C>) -> Box<Future<Item = (), Error = ()>>
-        where T: AsyncRead + AsyncWrite + 'static,
-              C: Decoder<Item = GridClientRequest, Error = io::Error> + Encoder<Item = GridClientResponse, Error = io::Error> + 'static
+/// Generalization of a service that handles clients in four separate steps:
+///
+///  - **Connect** takes some "handshake" data and an IO object, performing any necessary side-effects.
+///  - **Handle Input** treats the client's input as a Stream, yielding a Future that completes when all input has been handled.
+///  - **Handle Output** treats the client's output as a Sink, returning a Future that completes when all output has been sent.
+///  - **Disconnect** performs some side-effects when either the Input or Output handler finishes or fails
+///
+trait IOService<T, C> where Self : Clone + 'static {
+    type HandshakeResult;
+    type ClientType : Clone + 'static;
+    type ClientInputData;
+    type ClientOutputData;
+    type UnitFuture : Future<Item = (), Error = ()> + 'static;
+    type ConnectionFuture : Future<Item = (Self::ClientType, Self::ClientInputData, Self::ClientOutputData, ClientIO<T, C>), Error = ()> + 'static;
+
+    fn on_connect(&self, handshake_result: Self::HandshakeResult, io: ClientIO<T, C>) -> Self::ConnectionFuture;
+    fn handle_incoming(&self, client: Self::ClientType, client_input_data: Self::ClientInputData, input: SplitStream<Framed<T, C>>) -> Self::UnitFuture;
+    fn handle_outgoing(&self, client: Self::ClientType, client_output_data: Self::ClientOutputData, output: SplitSink<Framed<T, C>>) -> Self::UnitFuture;
+    fn handle_disconnect(&self, client: Self::ClientType) -> Self::UnitFuture;
+
+    /// Main handler method.
+    ///
+    /// Given the result of an already-completed handshake and an IO object,
+    /// run the connection handler to get the associated input/output data,
+    /// then run the input/output handlers with their respective data and halves of the IO object,
+    /// finally running the disconnect handler.
+    ///
+    fn handle_client(self, handshake_result: Self::HandshakeResult, io: ClientIO<T, C>) -> Box<Future<Item = (), Error = ()>>
     {
-        let self_ref = self.clone();
-        let raw_future = self.on_connect(handshake_result, io).and_then(move |(client_data, io)| {
+        let raw_future = self.on_connect(handshake_result, io).and_then(move |(client, client_input_data, client_output_data, io)| {
             // Grab the R/W & I/O objects from the connect result.
             // Note that the method's `io` parameter is consumed by `on_connect`, since that method could potentially do some IO.
             let ClientIO{ reader, writer } = io;
-            let (client_ident, client_input_data, client_output_data) = client_data;
 
             // Run the input and output handlers to get a Future for each respective completion/hangup.
             // Clone the `client_ident` because the handler implementations will want to move the value, and we need to be able to use it later.
-            let handled_input = self_ref.handle_incoming(client_ident.clone(), client_input_data, reader);
-            let handled_output = self_ref.handle_outgoing(client_ident.clone(), client_output_data, writer);
+            let handled_input = self.handle_incoming(client.clone(), client_input_data, reader);
+            let handled_output = self.handle_outgoing(client.clone(), client_output_data, writer);
 
             // Select the first of the IO futures to either finish or fail.
             // We don't care about the return type, as it will be discarded by the disconnect handler.
@@ -539,14 +461,37 @@ impl ServerStuff {
             // IMPORTANT: use `then`, not `and_then`, because we want this closure to run regardless of the success or error of the IO handler.
             // If the client goofs up and we hang up on them, that's an error, but we still want to de-register that client!
             handled_io.then(move |_| {
-                self_ref.handle_disconnect(client_ident)
+                self.handle_disconnect(client)
             })
         });
 
         Box::new(raw_future)
     }
+}
 
-    fn on_connect<T: 'static, C: 'static>(&self, handshake_result: ClientHandshakeOut, io: ClientIO<T, C>) -> Box<Future<Item = ((Client, (), ClientBroadcast), ClientIO<T, C>), Error = ()>> {
+/// IOService that communicates with `GridClient` Request/Response messages to
+/// drive updates to a `Grid` and broadcast updates to all connected clients.
+#[derive(Clone)]
+struct GridServerHandle {
+    clients: ClientRegistry,
+    grid_inbox: GridInbox,
+}
+
+impl <T, C> IOService<T, C> for GridServerHandle
+    where T: AsyncRead + AsyncWrite + 'static,
+          C: Decoder<Item = GridClientRequest, Error = io::Error> + Encoder<Item = GridClientResponse, Error = io::Error> + 'static
+{
+    type HandshakeResult = ClientHandshakeOut;
+    type ClientType = Client;
+    type ClientInputData = ();
+    type ClientOutputData = ClientBroadcast;
+    type UnitFuture = Box<Future<Item = (), Error = ()>>;
+    type ConnectionFuture = Box<Future<Item = (Self::ClientType, Self::ClientInputData, Self::ClientOutputData, ClientIO<T, C>), Error = ()>>;
+
+    /// When a client connects, add it to the "client registry" so that future GridUpdates can be broadcast to it.
+    /// Notify the grid of a "new player" associated with the new client.
+    ///
+    fn on_connect(&self, handshake_result: ClientHandshakeOut, io: ClientIO<T, C>) -> Self::ConnectionFuture {
         let ClientHandshakeOut{ uid, name, addr } = handshake_result;
         let (client, client_broadcast) = Client::new(uid, name, addr);
 
@@ -556,13 +501,15 @@ impl ServerStuff {
         // Request a new "Player" be added to the grid at point {0, 0}
         self.grid_inbox.send(GridMessage::Connect(uid, name, GridPoint(0, 0))).unwrap();
 
-        Box::new(future::ok(((client, (), client_broadcast), io)))
+        Box::new(future::ok((client, (), client_broadcast, io)))
     }
 
-    fn handle_incoming<T, C>(&self, client_ident: Client, client_input_data: (), input: SplitStream<Framed<T, C>>) -> Box<Future<Item = (), Error = ()>>
-        where T: AsyncRead + AsyncWrite + 'static,
-              C: Decoder<Item = GridClientRequest, Error = io::Error> + Encoder<Item = GridClientResponse, Error = io::Error> + 'static
-    {
+    /// Handle all of the requests made by the client.
+    ///
+    /// Certain events are treated as errors which cause the server to hang up on the client.
+    /// The rest are interpreted as `GridMessages` and forwarded to the `Grid`.
+    ///
+    fn handle_incoming(&self, client_ident: Client, _client_input_data: (), input: SplitStream<Framed<T, C>>) -> Self::UnitFuture {
         let client = client_ident;
         let uid = client.uid;
         let client_inbox = client.inbox.clone();
@@ -595,10 +542,11 @@ impl ServerStuff {
         Box::new(raw_handler)
     }
 
-    fn handle_outgoing<T, C>(&self, client_ident: Client, client_output_data: ClientBroadcast, output: SplitSink<Framed<T, C>>) -> Box<Future<Item = (), Error = ()>>
-        where T: AsyncRead + AsyncWrite + 'static,
-              C: Decoder<Item = GridClientRequest, Error = io::Error> + Encoder<Item = GridClientResponse, Error = io::Error> + 'static
-    {
+    /// Send all of the response messages to the client through the socket.
+    ///
+    /// Most of the messages sent in this manner are coming from the `Grid`'s game loop,
+    /// which broadcasts its state updates to all connected clients.
+    fn handle_outgoing(&self, _client: Client, client_output_data: ClientBroadcast, output: SplitSink<Framed<T, C>>) -> Self::UnitFuture {
         let client_broadcast = client_output_data;
         let outgoing_messages = client_broadcast.map_err(|_| fake_io_error("Error receiving broadcast message"));
         let raw_future = output.send_all(outgoing_messages)
@@ -608,8 +556,10 @@ impl ServerStuff {
         Box::new(raw_future)
     }
 
-    fn handle_disconnect(&self, client_ident: Client) -> Box<Future<Item = (), Error = ()>> {
-        let uid = client_ident.uid;
+    /// De-register the client so that the server doesn't keep trying to broadcast messages to it.
+    ///
+    fn handle_disconnect(&self, client: Client) -> Self::UnitFuture {
+        let uid = client.uid;
         let removed = self.clients.remove(&uid);
         if removed.is_some() {
             println!("successfully de-registered the disconnected client");
