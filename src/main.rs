@@ -9,8 +9,6 @@ extern crate tokio_service;
 
 mod codecs;
 
-use bytes::BytesMut;
-
 use futures::{future, Future, Stream, Sink};
 use futures::stream::{SplitSink, SplitStream};
 use futures::sync::mpsc::{unbounded as stream_channel, UnboundedSender, UnboundedReceiver};
@@ -18,21 +16,20 @@ use futures::sync::mpsc::{unbounded as stream_channel, UnboundedSender, Unbounde
 use rand::{Rand, Rng};
 
 use std::collections::HashMap;
-use std::convert::From;
-use std::fmt::Debug;
+use std::collections::hash_map::RandomState;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::str;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Sender, Receiver, SendError};
+use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread;
 
 use tokio_core::net::TcpListener;
 use tokio_core::reactor::Core;
 use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_io::codec::Framed;
+use tokio_io::codec::{Encoder, Decoder, Framed};
 use tokio_proto::pipeline::ServerProto;
 use tokio_proto::TcpServer;
 use tokio_service::Service;
@@ -54,10 +51,11 @@ fn main() {
             let handle = core.handle();
             let address = "0.0.0.0:12345".parse().unwrap();
             let listener = TcpListener::bind(&address, &core.handle()).unwrap();
-            let uid_counter = Rc::new(AtomicUsize::new(0));
             let (mut grid,direct_grid_message_sender,grid_update_receiver) = Grid::new();
             let outer_grid_message_sender = Rc::new(direct_grid_message_sender);
             thread::spawn(move || grid.run());
+
+            let mut handshake = ClientHandshake::new();
 
             let connections: Arc<Mutex<HashMap<u64, Client, _>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -81,39 +79,21 @@ fn main() {
                 let mut rng = rand::thread_rng();
                 let player_name = rng.gen_ascii_chars().next().unwrap();
                 let initial_pos = rng.gen();
-                let (writer, reader) = socket.framed(codecs::GridTextCodec).split();
                 let connections = connections.clone();
-                let uid_counter_ref = uid_counter.clone();
                 // channel for outside sources to send messages to the socket
                 let (client_grid_updates, grid_updates) = stream_channel::<GridClientResponse>();
 
-                let handshake = writer.send(GridClientResponse::LoginPrompt).and_then(move |writer_cont| {
-                    reader.into_future().map_err(|(err, _)| err).and_then(move |(hopefully_login, read_cont)| {
-                        // NOTE: don't return futures from the match - the types end up not being the same,
-                        // and the future combinator stuff just can't handle that.
-                        let login_attempt: io::Result<PlayerName> = match hopefully_login {
-                            Some(GridClientRequest::LoginAs(player_name)) => Ok(player_name),
-                            other => {
-                                println!("Unsuccessful login attempt from {}: {:?}", peer_addr, other);
-                                Err(fake_io_error("Expected login attempt"))
-                            }
-                        };
-                        // send the handshake acknowledgement and return the client+reader+writer triplet
-                        future::result(login_attempt).and_then(move |player_name| {
-                            let uid = uid_counter_ref.fetch_add(1, Ordering::SeqCst) as u64;
-                            println!("Successful login handshake by client {} with name {}", uid, player_name);
-                            let client = Client {
-                                uid,
-                                player_name,
-                                addr: peer_addr,
-                                sender: Rc::new(client_grid_updates),
-                            };
-                            writer_cont.send(GridClientResponse::LoggedIn(uid)).and_then(|writer_cont| {
-                                future::ok((client, writer_cont, read_cont))
-                            })
-                        })
-                    })
-                }).map_err(|_| ());
+                let handshake = handshake.call(socket, peer_addr, codecs::GridTextCodec).and_then(move |handshake_out| {
+                    let ClientHandshakeOut{ uid, name, io } = handshake_out;
+                    let (writer, reader) = io.split();
+                    let client = Client {
+                        uid,
+                        player_name,
+                        addr: peer_addr,
+                        sender: Rc::new(client_grid_updates),
+                    };
+                    future::ok((client, writer, reader))
+                });
 
                 // clone the connections Arc so we can move it into the closure
                 let connections_1 = connections.clone();
@@ -305,16 +285,6 @@ pub enum GridServerHangup {
     UnrecognizedRequest,
     InternalError
 }
-impl From<io::Error> for GridServerHangup {
-    fn from(err: io::Error) -> Self {
-        GridServerHangup::InternalError
-    }
-}
-impl <T: Debug> From<SendError<T>> for GridServerHangup {
-    fn from(err: SendError<T>) -> Self {
-        GridServerHangup::InternalError
-    }
-}
 
 #[derive(Debug)]
 enum GridMessage {
@@ -378,6 +348,66 @@ impl Grid {
     }
 }
 
+struct ClientHandshakeOut<T, C> {
+    uid: PlayerUid,
+    name: PlayerName,
+    io: Framed<T, C>
+}
+
+struct ClientHandshake {
+    uid_counter: Rc<AtomicUsize>,
+}
+
+impl ClientHandshake {
+    fn new() -> ClientHandshake {
+        ClientHandshake {
+            uid_counter: Rc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn call<T, C>(&mut self, socket: T, peer_addr: SocketAddr, codec: C) -> Box<Future<Item = ClientHandshakeOut<T, C>, Error = ()>>
+        where T: AsyncRead + AsyncWrite + 'static,
+        C : Decoder<Item = GridClientRequest, Error = io::Error> + Encoder<Item = GridClientResponse, Error = io::Error> + 'static
+    {
+        let (writer, reader) = socket.framed(codec).split();
+        let uid_counter = self.uid_counter.clone();
+        // Send a login prompt
+        // This gives a future containing the "continuation" of the writer.
+        let raw_future = writer.send(GridClientResponse::LoginPrompt).and_then(move |writer_cont| {
+
+            // Read a message from the client, which is hopefully a Login.
+            // This gives a future containing the message and the "continuation" of the read stream.
+            reader.into_future().map_err(|(err, _)| err).and_then(move |(hopefully_login, read_cont)| {
+
+                // Check that the received message was a login attempt, treating anything else as an error.
+                let login_attempt: io::Result<PlayerName> = match hopefully_login {
+                    Some(GridClientRequest::LoginAs(player_name)) => Ok(player_name),
+                    other => {
+                        println!("Unsuccessful login attempt from {}: {:?}", peer_addr, other);
+                        Err(fake_io_error("Expected login attempt"))
+                    }
+                };
+
+                // Assuming the login was Ok, generate a PlayerUid for the client...
+                future::result(login_attempt).and_then(move |name| {
+                    let uid: u64 = uid_counter.fetch_add(1, Ordering::SeqCst) as u64;
+                    println!("Successful login handshake by client {} with name {}", uid, name);
+
+                    // Send the client an acknowledgement containing the PlayerUid
+                    writer_cont.send(GridClientResponse::LoggedIn(uid)).and_then(move |writer_cont| {
+                        future::ok(ClientHandshakeOut{
+                            uid,
+                            name,
+                            io: writer_cont.reunite(read_cont).unwrap()
+                        })
+                    })
+                })
+            })
+        }).map_err(|_| ());
+
+        Box::new(raw_future)
+    }
+}
 
 
 // implementation for "simple server" tutorial, part 1 (Codec)
