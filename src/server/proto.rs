@@ -9,7 +9,6 @@ pub struct ClientIO<T, C> {
     pub reader: SplitStream<Framed<T, C>>,
 }
 
-
 /// Generalization of a service that handles clients in four separate steps:
 ///
 ///  - **Connect** takes some "handshake" data and an IO object, performing any necessary side-effects.

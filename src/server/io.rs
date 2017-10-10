@@ -4,15 +4,16 @@ use bytes::BytesMut;
 use std::io;
 use std::str;
 use tokio_io::codec::{Encoder, Decoder};
+//use tokio_serde_cbor::{Encoder as BinEncoder, Decoder as BinDecoder};
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum GridClientRequest {
     LoginAs(PlayerName),
     MoveRel(GridPoint),
     Unrecognized(String),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub enum GridClientResponse {
     LoginPrompt,
     LoggedIn(PlayerUid),
@@ -20,7 +21,7 @@ pub enum GridClientResponse {
     Hangup(GridServerHangup),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub enum GridServerHangup {
     UnexpectedLogin,
     UnrecognizedRequest,

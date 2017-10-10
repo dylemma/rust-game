@@ -2,11 +2,17 @@
 extern crate bytes;
 extern crate futures;
 extern crate rand;
+extern crate serde;
+#[macro_use] extern crate serde_derive;
 extern crate tokio_core;
 extern crate tokio_io;
+extern crate tokio_proto;
+extern crate tokio_serde_bincode;
 
 mod game;
+mod client;
 mod server;
+mod binio;
 
 fn main() {
     let arg1 = std::env::args().nth(1);
@@ -14,7 +20,7 @@ fn main() {
 
     match arg1_ref {
         Some("server") => server::run(),
-        Some("client") => println!("TODO"),
+        Some("client") => client::run(),
         _ => println!("Argument should be either 'server' or 'client'"),
     }
 }

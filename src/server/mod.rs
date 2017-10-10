@@ -1,7 +1,7 @@
 mod proto;
 use self::proto::*;
 
-mod io;
+pub mod io;
 use self::io::*;
 
 use futures::{future, Future, Poll, Stream, Sink};
@@ -9,6 +9,7 @@ use futures::stream::{SplitSink, SplitStream};
 use futures::sync::mpsc::{unbounded as stream_channel, UnboundedSender, UnboundedReceiver};
 
 use game::*;
+use binio::*;
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
@@ -198,6 +199,12 @@ impl ClientRegistry {
     }
 }
 
+
+struct ServerIOMessages;
+impl IOMessages for ServerIOMessages {
+    type Input = GridClientRequest;
+    type Output = GridClientResponse;
+}
 
 struct ClientHandshake {
     uid_counter: Rc<AtomicUsize>,

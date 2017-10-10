@@ -6,7 +6,7 @@ use rand::{Rand, Rng};
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Sender, Receiver};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct GridPoint(pub i32, pub i32);
 impl GridPoint {
     fn move_by(&mut self, d_pos: &GridPoint) {
@@ -65,7 +65,7 @@ pub enum GridMessage {
     MoveRel(PlayerUid, GridPoint),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub enum GridUpdate {
     Connected(PlayerUid, PlayerName, GridPoint),
     MovedTo(PlayerUid, GridPoint),
