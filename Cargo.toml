@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Dylan Halperin <dylan@dylemma.io>"]
 
 [dependencies]
+bincode = "^0.8"
 bytes = "0.4"
 futures = "0.1"
 rand = "0.3"
@@ -13,4 +14,5 @@ tokio-io = "0.1"
 tokio-core = "0.1"
 tokio-proto = "0.1"
 tokio-serde = "0.1"
-tokio-serde-bincode = "0.1"
+#tokio-serde-bincode = "0.1"
+tokio-serde-bincode = { git = "https://github.com/alexcrichton/tokio-serde-bincode" }

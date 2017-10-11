@@ -1,4 +1,5 @@
 // A tiny async echo server with tokio-core
+extern crate bincode;
 extern crate bytes;
 extern crate futures;
 extern crate rand;

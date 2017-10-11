@@ -9,7 +9,8 @@ use std::io;
 use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::io::{ReadHalf, WriteHalf};
 use tokio_io::codec::length_delimited;
-use tokio_serde_bincode::{Error as BincodeError, ReadBincode, WriteBincode};
+use bincode::{Error as BincodeError, ErrorKind as BincodeErrorKind};
+use tokio_serde_bincode::{ReadBincode, WriteBincode};
 
 /// Type hint for constructing `BincodeIO` instances.
 ///
@@ -177,8 +178,8 @@ fn io_error(msg: &str) -> io::Error {
 }
 
 fn downgrade_bincode_error(e: BincodeError) -> io::Error {
-    match e {
-        BincodeError::Io(e) => e,
-        BincodeError::Serde(_) => io_error("Bincode ser/de error")
+    match *e {
+        BincodeErrorKind::IoError(e) => e,
+        e => io_error(&format!("Error from bincode: {:?}", e)),
     }
 }
