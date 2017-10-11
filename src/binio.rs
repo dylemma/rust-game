@@ -58,8 +58,8 @@ impl <T, I, O> BincodeIO<T, I, O>
     }
 
     /// Consume the BincodeIO to get a Reader + Writer tuple.
-    pub fn split(self) -> (BincodeStream<T, I>, BincodeSink<T, O>) {
-        (self.reader, self.writer)
+    pub fn split(self) -> (BincodeSink<T, O>, BincodeStream<T, I>) {
+        (self.writer, self.reader)
     }
 
     /// Combine an existing Reader + Writer as a BincodeIO

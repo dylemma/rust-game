@@ -92,7 +92,7 @@ pub fn run() {
         let server_handle = server_handle.clone();
 
         // run the handshake and pass its result along to the `server_handle` to get a Future representing the completed handling of the client
-        let handle_client = handshake.call(socket, peer_addr, io::GridTextCodec).and_then(move |(handshake_out, io)| {
+        let handle_client = handshake.call(socket, peer_addr).and_then(move |(handshake_out, io)| {
             server_handle.handle_client(handshake_out, io)
         });
 
@@ -199,6 +199,9 @@ impl ClientRegistry {
     }
 }
 
+pub type ServerIO<T> = BincodeIO<T, GridClientRequest, GridClientResponse>;
+pub type ServerIn<T> = BincodeStream<T, GridClientRequest>;
+pub type ServerOut<T> = BincodeSink<T, GridClientResponse>;
 
 struct ServerIOMessages;
 impl IOMessages for ServerIOMessages {
@@ -217,23 +220,22 @@ impl ClientHandshake {
         }
     }
 
-    fn call<T, C>(&mut self, socket: T, addr: SocketAddr, codec: C) -> Box<Future<Item = (ClientHandshakeOut, ClientIO<T, C>), Error = ()>>
-        where T: AsyncRead + AsyncWrite + 'static,
-              C : Decoder<Item = GridClientRequest, Error = IOError> + Encoder<Item = GridClientResponse, Error = IOError> + 'static
+    fn call<T>(&mut self, socket: T, addr: SocketAddr) -> Box<Future<Item = (ClientHandshakeOut, ServerIO<T>), Error = ()>>
+        where T: AsyncRead + AsyncWrite + 'static
     {
-        let (writer, reader) = socket.framed(codec).split();
+        let io = BincodeIO::new(socket, ServerIOMessages);
         let uid_counter = self.uid_counter.clone();
         // Send a login prompt
         // This gives a future containing the "continuation" of the writer.
-        let raw_future = writer.send(GridClientResponse::LoginPrompt).and_then(move |writer_cont| {
+        let raw_future = io.write_one(GridClientResponse::LoginPrompt).and_then(move |io| {
 
             // Read a message from the client, which is hopefully a Login.
             // This gives a future containing the message and the "continuation" of the read stream.
-            reader.into_future().map_err(|(err, _)| err).and_then(move |(hopefully_login, read_cont)| {
+            io.read_one().and_then(move |(hopefully_login, io)| {
 
                 // Check that the received message was a login attempt, treating anything else as an error.
                 let login_attempt: IOResult<PlayerName> = match hopefully_login {
-                    Some(GridClientRequest::LoginAs(player_name)) => Ok(player_name),
+                    GridClientRequest::LoginAs(player_name) => Ok(player_name),
                     other => {
                         println!("Unsuccessful login attempt from {}: {:?}", addr, other);
                         Err(fake_io_error("Expected login attempt"))
@@ -246,14 +248,15 @@ impl ClientHandshake {
                     println!("Successful login handshake by client {} with name {}", uid, name);
 
                     // Send the client an acknowledgement containing the PlayerUid
-                    writer_cont.send(GridClientResponse::LoggedIn(uid)).and_then(move |writer_cont| {
+                    io.write_one(GridClientResponse::LoggedIn(uid)).and_then(move |io| {
                         let handshake_result = ClientHandshakeOut { uid, name, addr };
-                        let io = ClientIO { writer: writer_cont, reader: read_cont };
                         future::ok((handshake_result, io))
                     })
                 })
             })
-        }).map_err(|_| ());
+        }).map_err(|err| {
+            println!("IO error during client handshake: {:?}", err);
+        });
 
         Box::new(raw_future)
     }
@@ -268,21 +271,20 @@ struct GridServerHandle {
     grid_inbox: GridInbox,
 }
 
-impl <T, C> IOService<T, C> for GridServerHandle
-    where T: AsyncRead + AsyncWrite + 'static,
-          C: Decoder<Item = GridClientRequest, Error = IOError> + Encoder<Item = GridClientResponse, Error = IOError> + 'static
+impl <T> IOService<T> for GridServerHandle
+    where T: AsyncRead + AsyncWrite + 'static
 {
     type HandshakeResult = ClientHandshakeOut;
     type ClientType = Client;
     type ClientInputData = ();
     type ClientOutputData = ClientBroadcast;
     type UnitFuture = Box<Future<Item = (), Error = ()>>;
-    type ConnectionFuture = Box<Future<Item = (Self::ClientType, Self::ClientInputData, Self::ClientOutputData, ClientIO<T, C>), Error = ()>>;
+    type ConnectionFuture = Box<Future<Item = (Self::ClientType, Self::ClientInputData, Self::ClientOutputData, ServerIO<T>), Error = ()>>;
 
     /// When a client connects, add it to the "client registry" so that future GridUpdates can be broadcast to it.
     /// Notify the grid of a "new player" associated with the new client.
     ///
-    fn on_connect(&self, handshake_result: ClientHandshakeOut, io: ClientIO<T, C>) -> Self::ConnectionFuture {
+    fn on_connect(&self, handshake_result: ClientHandshakeOut, io: ServerIO<T>) -> Self::ConnectionFuture {
         let ClientHandshakeOut{ uid, name, addr } = handshake_result;
         let (client, client_broadcast) = Client::new(uid, name, addr);
 
@@ -300,7 +302,7 @@ impl <T, C> IOService<T, C> for GridServerHandle
     /// Certain events are treated as errors which cause the server to hang up on the client.
     /// The rest are interpreted as `GridMessages` and forwarded to the `Grid`.
     ///
-    fn handle_incoming(&self, client_ident: Client, _client_input_data: (), input: SplitStream<Framed<T, C>>) -> Self::UnitFuture {
+    fn handle_incoming(&self, client_ident: Client, _client_input_data: (), input: ServerIn<T>) -> Self::UnitFuture {
         let client = client_ident;
         let uid = client.uid;
         let client_inbox = client.inbox.clone();
@@ -337,7 +339,7 @@ impl <T, C> IOService<T, C> for GridServerHandle
     ///
     /// Most of the messages sent in this manner are coming from the `Grid`'s game loop,
     /// which broadcasts its state updates to all connected clients.
-    fn handle_outgoing(&self, _client: Client, client_output_data: ClientBroadcast, output: SplitSink<Framed<T, C>>) -> Self::UnitFuture {
+    fn handle_outgoing(&self, _client: Client, client_output_data: ClientBroadcast, output: ServerOut<T>) -> Self::UnitFuture {
         let client_broadcast = client_output_data;
         let outgoing_messages = client_broadcast.map_err(|_| fake_io_error("Error receiving broadcast message"));
         let raw_future = output.send_all(outgoing_messages)

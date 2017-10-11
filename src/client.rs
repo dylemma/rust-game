@@ -37,7 +37,7 @@ fn read_nonempty_line() -> io::Result<String> {
 }
 
 pub fn run() {
-    let addr = "127.0.0.12345".parse::<SocketAddr>().unwrap();
+    let addr = "127.0.0.1:12345".parse::<SocketAddr>().unwrap();
     let mut core = Core::new().unwrap();
     let handle = core.handle();
     let tcp = TcpStream::connect(&addr, &handle);
@@ -53,8 +53,10 @@ pub fn run() {
             })
             // now that we got the prompt from the server, prompt the user for a name
             .and_then(|io|{
-                println!("Enter your name to log in! (really just one letter for now)");
-                read_nonempty_line().map(|line| (line.chars().nth(0).unwrap(), io))
+                // TODO: restore prompt logic
+//                println!("Enter your name to log in! (really just one letter for now)");
+//                read_nonempty_line().map(|line| (line.chars().nth(0).unwrap(), io))
+                Ok(('D', io))
             })
             // send the name to the server as a `LoginAs` request
             .and_then(|(player_name, io)| {

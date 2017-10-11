@@ -1,8 +1,10 @@
 use futures::Future;
 use futures::stream::{SplitSink, SplitStream};
 
+use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_io::codec::Framed;
 
+use super::{ServerIO, ServerIn, ServerOut};
 
 pub struct ClientIO<T, C> {
     pub writer: SplitSink<Framed<T, C>>,
@@ -16,17 +18,17 @@ pub struct ClientIO<T, C> {
 ///  - **Handle Output** treats the client's output as a Sink, returning a Future that completes when all output has been sent.
 ///  - **Disconnect** performs some side-effects when either the Input or Output handler finishes or fails
 ///
-pub trait IOService<T, C> where Self : Clone + 'static {
+pub trait IOService<T> where Self : Clone + 'static, T: AsyncRead + AsyncWrite + 'static {
     type HandshakeResult;
     type ClientType : Clone + 'static;
     type ClientInputData;
     type ClientOutputData;
     type UnitFuture : Future<Item = (), Error = ()> + 'static;
-    type ConnectionFuture : Future<Item = (Self::ClientType, Self::ClientInputData, Self::ClientOutputData, ClientIO<T, C>), Error = ()> + 'static;
+    type ConnectionFuture : Future<Item = (Self::ClientType, Self::ClientInputData, Self::ClientOutputData, ServerIO<T>), Error = ()> + 'static;
 
-    fn on_connect(&self, handshake_result: Self::HandshakeResult, io: ClientIO<T, C>) -> Self::ConnectionFuture;
-    fn handle_incoming(&self, client: Self::ClientType, client_input_data: Self::ClientInputData, input: SplitStream<Framed<T, C>>) -> Self::UnitFuture;
-    fn handle_outgoing(&self, client: Self::ClientType, client_output_data: Self::ClientOutputData, output: SplitSink<Framed<T, C>>) -> Self::UnitFuture;
+    fn on_connect(&self, handshake_result: Self::HandshakeResult, io: ServerIO<T>) -> Self::ConnectionFuture;
+    fn handle_incoming(&self, client: Self::ClientType, client_input_data: Self::ClientInputData, input: ServerIn<T>) -> Self::UnitFuture;
+    fn handle_outgoing(&self, client: Self::ClientType, client_output_data: Self::ClientOutputData, output: ServerOut<T>) -> Self::UnitFuture;
     fn handle_disconnect(&self, client: Self::ClientType) -> Self::UnitFuture;
 
     /// Main handler method.
@@ -36,12 +38,10 @@ pub trait IOService<T, C> where Self : Clone + 'static {
     /// then run the input/output handlers with their respective data and halves of the IO object,
     /// finally running the disconnect handler.
     ///
-    fn handle_client(self, handshake_result: Self::HandshakeResult, io: ClientIO<T, C>) -> Box<Future<Item = (), Error = ()>>
+    fn handle_client(self, handshake_result: Self::HandshakeResult, io: ServerIO<T>) -> Box<Future<Item = (), Error = ()>>
     {
         let raw_future = self.on_connect(handshake_result, io).and_then(move |(client, client_input_data, client_output_data, io)| {
-            // Grab the R/W & I/O objects from the connect result.
-            // Note that the method's `io` parameter is consumed by `on_connect`, since that method could potentially do some IO.
-            let ClientIO{ reader, writer } = io;
+            let (writer, reader) = io.split();
 
             // Run the input and output handlers to get a Future for each respective completion/hangup.
             // Clone the `client_ident` because the handler implementations will want to move the value, and we need to be able to use it later.
