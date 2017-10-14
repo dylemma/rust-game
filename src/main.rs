@@ -10,9 +10,17 @@ extern crate tokio_io;
 extern crate tokio_proto;
 extern crate tokio_serde_bincode;
 
+extern crate piston;
+extern crate piston_window;
+extern crate graphics;
+extern crate opengl_graphics;
+extern crate input;
+extern crate nalgebra as na;
+
 mod game;
 mod client;
 mod server;
+mod ui;
 mod binio;
 
 fn main() {
@@ -22,6 +30,7 @@ fn main() {
     match arg1_ref {
         Some("server") => server::run(),
         Some("client") => client::run(),
+        Some("ui") => ui::run(),
         _ => println!("Argument should be either 'server' or 'client'"),
     }
 }
