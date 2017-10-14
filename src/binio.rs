@@ -63,11 +63,6 @@ impl <T, I, O> BincodeIO<T, I, O>
         (self.writer, self.reader)
     }
 
-    /// Combine an existing Reader + Writer as a BincodeIO
-    pub fn from(reader: BincodeStream<T, I>, writer: BincodeSink<T, O>) -> BincodeIO<T, I, O> {
-        BincodeIO { reader, writer }
-    }
-
     /// Read the next message from the `reader` stream.
     ///
     /// Returns a future that resolves as a tuple containing the message and the continuation of this IO object.

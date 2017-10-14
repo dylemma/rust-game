@@ -5,7 +5,6 @@ pub mod io;
 use self::io::*;
 
 use futures::{future, Future, Poll, Stream, Sink};
-use futures::stream::{SplitSink, SplitStream};
 use futures::sync::mpsc::{unbounded as stream_channel, UnboundedSender, UnboundedReceiver};
 
 use game::*;
@@ -24,7 +23,6 @@ use std::thread;
 use tokio_core::net::TcpListener;
 use tokio_core::reactor::Core;
 use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_io::codec::{Encoder, Decoder, Framed};
 
 pub fn run() {
     // The event loop that deals with all of the async IO we want to do

@@ -1,15 +1,8 @@
 use futures::Future;
-use futures::stream::{SplitSink, SplitStream};
 
 use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_io::codec::Framed;
 
 use super::{ServerIO, ServerIn, ServerOut};
-
-pub struct ClientIO<T, C> {
-    pub writer: SplitSink<Framed<T, C>>,
-    pub reader: SplitStream<Framed<T, C>>,
-}
 
 /// Generalization of a service that handles clients in four separate steps:
 ///
