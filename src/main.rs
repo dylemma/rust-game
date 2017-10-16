@@ -9,6 +9,7 @@ extern crate tokio_core;
 extern crate tokio_io;
 extern crate tokio_proto;
 extern crate tokio_serde_bincode;
+extern crate tokio_timer;
 
 extern crate piston;
 extern crate piston_window;

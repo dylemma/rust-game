@@ -1,4 +1,4 @@
-use futures::{Poll, Stream};
+use futures::{Future, Poll, Stream};
 use futures::sync::mpsc::{unbounded as stream_channel, UnboundedSender, UnboundedReceiver};
 
 use rand::{Rand, Rng, thread_rng};
@@ -13,6 +13,7 @@ use rand::ThreadRng;
 use std::cell::{Ref, RefCell};
 use std::ops::{Deref, DerefMut};
 use std::thread;
+use tokio_timer::{Timer, wheel};
 
 type EntityId = u64;
 
@@ -207,6 +208,21 @@ impl ToSpawn {
     }
 }
 
+trait Sleeper {
+    fn sleep(&self, dur: Duration) -> ();
+}
+
+/// Seemingly the most accurate and relatively-low CPU-using sleep implementation.
+/// Comparing with `thread::sleep`, the accuracy is better (when configured right).
+/// Comparing with a CPU-bound loop, the accuracy is a bit worse, but obviously it
+/// uses much less CPU power, which I think is more important for running the game loop.
+struct TokioTimer(Timer);
+impl Sleeper for TokioTimer {
+    fn sleep(&self, dur: Duration) -> () {
+        self.0.sleep(dur).wait().unwrap();
+    }
+}
+
 pub struct Game {
     next_entity_id: EntityId,
     clients: Vec<ConnectedPlayer>,
@@ -214,7 +230,6 @@ pub struct Game {
     entities: BTreeMap<EntityId, Entity>,
     spawn_queue: VecDeque<ToSpawn>,
     inputs: Receiver<GameInput>,
-//    inputs_buffer: Vec<GameInput>,
 }
 impl Game {
     pub fn new() -> (Game, Sender<GameInput>) {
@@ -231,23 +246,39 @@ impl Game {
     }
 
     pub fn run(&mut self) {
+        let sleepy = TokioTimer(wheel()
+            .tick_duration(Duration::from_millis(1))
+            .max_timeout(Duration::from_millis(10))
+            .build());
+
         let mut last_update_time = Instant::now();
         let target_tick_rate = Duration::from_millis(8);
         let dt = 0.008;
 
-        let mut countdown = 100;
+        let mut countdown = 200;
         loop {
-            let now = Instant::now();
-            let time_since_last = now - last_update_time;
-            if time_since_last < target_tick_rate {
-                continue;
-            }
-            last_update_time = now;
-            countdown -= 1;
-            if countdown >= 0 {
-                println!("waited {:?} to update", time_since_last)
-            }
+            let before_tick = Instant::now();
+            let next_tick_time = before_tick + target_tick_rate;
             self.tick(dt);
+            let after_tick = Instant::now();
+            let tick_time = after_tick - before_tick;
+
+            // sleep until the next_tick_time
+            let sleep_time = {
+                if next_tick_time > after_tick {
+                    let sleep_duration = next_tick_time - after_tick;
+                    sleepy.sleep(sleep_duration);
+                    let after_sleep = Instant::now();
+                    after_sleep - after_tick
+                } else {
+                    Duration::new(0, 0)
+                }
+            };
+
+            if cfg!(server_tick_stats = "true") {
+                println!("Tick [{}s {}ns], Sleep [{}s {}ns]", tick_time.as_secs(), tick_time.subsec_nanos(), sleep_time.as_secs(), sleep_time.subsec_nanos());
+            }
+
         }
     }
 

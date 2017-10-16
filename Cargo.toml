@@ -14,6 +14,7 @@ tokio-io = "0.1"
 tokio-core = "0.1"
 tokio-proto = "0.1"
 tokio-serde = "0.1"
+tokio-timer = "0.1"
 #tokio-serde-bincode = "0.1"
 tokio-serde-bincode = { git = "https://github.com/alexcrichton/tokio-serde-bincode" }
 
@@ -25,3 +26,7 @@ piston2d-graphics = "*"
 piston2d-opengl_graphics = "*"
 nalgebra = "0.13.0"
 fps_counter = "1.0.0"
+
+[features]
+default = []
+server_tick_stats = []
