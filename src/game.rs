@@ -15,12 +15,12 @@ use std::ops::{Deref, DerefMut};
 use std::thread;
 use tokio_timer::{Timer, wheel};
 
-type EntityId = u64;
+pub type EntityId = u64;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct Entity {
-    id: EntityId,
-    data: EntityAttribs,
+pub struct Entity {
+    pub id: EntityId,
+    pub data: EntityAttribs,
 }
 
 /// Stores the "static" and "dynamic" attributes for entities, i.e. Players and Bullets.
@@ -70,6 +70,22 @@ impl EntityAttribs {
             }
         }
     }
+
+    pub fn set_state(&self, new_state: EntityState) {
+        match (self, new_state) {
+            (&EntityAttribs::Player { ref state, .. }, EntityState::Player(ps)) => {
+                let mut s = state.borrow_mut();
+                *s = ps;
+            },
+            (&EntityAttribs::Bullet { ref state, .. }, EntityState::Bullet(bs)) => {
+                let mut s = state.borrow_mut();
+                *s = bs;
+            },
+            _ => {
+                println!("invalid input to set_state (wrong type)");
+            }
+        }
+    }
 }
 
 /// Stores only the "dynamic" attributes of an entity.
@@ -87,31 +103,36 @@ pub enum Target {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-pub struct Color([f64; 3]);
+pub struct Color([f32; 3]);
 impl Rand for Color {
     fn rand<R: Rng>(rng: &mut R) -> Self {
         Color([
-            rng.next_f64(),
-            rng.next_f64(),
-            rng.next_f64()
+            rng.next_f32(),
+            rng.next_f32(),
+            rng.next_f32()
         ])
+    }
+}
+impl Color {
+    pub fn to_vec4(&self) -> [f32; 4] {
+        [self.0[0], self.0[1], self.0[2], 1.0]
     }
 }
 
 /// Static attributes of a "player".
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct PlayerData {
-    speed: f64,
-    color: Color,
-    fire_cooldown: f64,
+    pub speed: f64,
+    pub color: Color,
+    pub fire_cooldown: f64,
 }
 
 /// Dynamic attributes of a "player".
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct PlayerState {
-    pos: Vec2,
-    directive: PlayerDirective,
-    remaining_fire_cooldown: f64,
+    pub pos: Vec2,
+    pub directive: PlayerDirective,
+    pub remaining_fire_cooldown: f64,
 }
 
 /// Static attributes of a "bullet"
@@ -130,8 +151,8 @@ pub struct BulletState {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct Vec2{
-    x: f64,
-    y: f64,
+    pub x: f64,
+    pub y: f64,
 }
 impl Vec2 {
     pub fn new(x: f64, y: f64) -> Vec2 {

@@ -227,7 +227,7 @@ pub type GameIO<T> = BincodeIO<T, GameInput, GameStateUpdate>;
 pub type GameIn<T> = BincodeStream<T, GameInput>;
 pub type GameOut<T> = BincodeSink<T, GameStateUpdate>;
 
-struct GameIOMessages;
+pub struct GameIOMessages;
 impl IOMessages for GameIOMessages {
     type Input = GameInput;
     type Output = GameStateUpdate;
@@ -248,22 +248,26 @@ impl GameServer {
         let (client_send, client_recv) = stream_channel();
         let game_handle = self.handle.clone();
 
+        let io = BincodeIO::new(socket, GameIOMessages);
+
         let handler = self.handle.new_connection(client_send).map_err(|_| ()).and_then(|client_id| {
-            let (socket_send, socket_recv) = BincodeIO::new(socket, GameIOMessages).split();
+            io.write_one(GameStateUpdate::SetClientId(client_id)).map_err(|_| ()).and_then(|io| {
+                let (socket_send, socket_recv) = io.split();
 
-            let handle_send = socket_send.send_all(client_recv.map_err(|_| fake_io_error("failed to receive message")))
-                .map(|_| ())
-                .map_err(|_| ());
+                let handle_send = socket_send.send_all(client_recv.map_err(|_| fake_io_error("failed to receive message")))
+                    .map(|_| println!("Finished sending?!"))
+                    .map_err(|e| println!("Error sending msg to client {:?}", e));
 
-            let handle_recv = socket_recv.for_each(move |game_input| {
-                game_handle.send(game_input);
-                Ok(())
-            }).map_err(|_| ());
+                let handle_recv = socket_recv.for_each(move |game_input| {
+                    game_handle.send(game_input);
+                    Ok(())
+                }).map_err(|e| println!("Error receiving message from client {:?}", e));
 
-            handle_send.select(handle_recv)
-                .map(|_| ())
-                .map_err(|_| ())
+                handle_send.select(handle_recv)
+                    .map(|_| ())
+                    .map_err(|_| ())
 
+            })
         });
 
         handle.spawn(handler);
