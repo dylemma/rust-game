@@ -16,6 +16,7 @@ extern crate graphics;
 extern crate opengl_graphics;
 extern crate input;
 extern crate nalgebra as na;
+extern crate fps_counter;
 
 mod game;
 mod client;
@@ -31,6 +32,7 @@ fn main() {
         Some("server") => server::run(),
         Some("client") => client::run(),
         Some("ui") => ui::run(),
+        Some("game") => server::run_game(),
         _ => println!("Argument should be either 'server' or 'client'"),
     }
 }

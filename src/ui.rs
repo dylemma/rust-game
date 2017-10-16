@@ -1,10 +1,11 @@
 use piston_window::*;
 use graphics::ellipse;
 use na::{Vector2};
+use fps_counter::FPSCounter;
+use std::time::Instant;
 
 pub fn run() {
     let mut window: PistonWindow = WindowSettings::new("Hello Piston!", [640, 480])
-        //.exit_on_esc(true)
         .build()
         .unwrap();
 
@@ -22,7 +23,10 @@ pub fn run() {
     let mut character_target = [100.0, 100.0];
     let mut mouse_pos = [0.0, 0.0];
     let mut is_mouse_down = false;
-    let follow_speed = 150.0;
+    let follow_speed = 300.0;
+
+    let mut fps_counter = FPSCounter::new();
+    let mut updated_since_render = false;
 
     while let Some(event) = window.next() {
 
@@ -54,7 +58,8 @@ pub fn run() {
         });
 
         event.update(|&args| {
-//            if is_mouse_down {
+            if !updated_since_render {
+                updated_since_render = true;
                 let dt = args.dt;
                 let dist = dt * follow_speed;
                 let mut movement: Vector2<f64> = Vector2::from(character_target) - Vector2::from(character_pos);
@@ -63,7 +68,10 @@ pub fn run() {
                     character_pos[0] += movement.x;
                     character_pos[1] += movement.y;
                 }
-//            }
+
+                let fps = fps_counter.tick();
+                println!("{} fps", fps);
+            }
         });
 
         event.render(|&args| {
@@ -82,6 +90,9 @@ pub fn run() {
                 character.draw(character_dims, &draw_state, context.transform, graphics);
                 character_border.draw(character_dims, &draw_state, context.transform, graphics);
             });
+
+            updated_since_render = false;
         });
+
     }
 }

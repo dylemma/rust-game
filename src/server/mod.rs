@@ -24,6 +24,33 @@ use tokio_core::net::TcpListener;
 use tokio_core::reactor::Core;
 use tokio_io::{AsyncRead, AsyncWrite};
 
+pub fn run_game() {
+    use game::*;
+    let mut core = Core::new().unwrap();
+    let handle = core.handle();
+
+    let (mut game, input_channel) = Game::new();
+    thread::spawn(move || game.run());
+
+    let (client_send, client_recv) = stream_channel();
+    let (new_client_msg, client_id_future) = GameInput::new_connection(client_send);
+
+    input_channel.send(new_client_msg).unwrap();
+    let task = client_id_future.map_err(|_| ()).and_then(|id| {
+        let update = GameInput::Input(PlayerInput{
+            from: id,
+            set_directive: PlayerDirective::MovingToward(Target::Location(Vec2::new(300.0, 400.0)))
+        });
+        input_channel.send(update).unwrap();
+        client_recv.for_each(|update| {
+//            println!("update: {:?}", update);
+            Ok(())
+        })
+    });
+
+    core.run(task).unwrap();
+}
+
 pub fn run() {
     // The event loop that deals with all of the async IO we want to do
     let mut core = Core::new().unwrap();

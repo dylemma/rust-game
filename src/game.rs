@@ -1,10 +1,445 @@
 use futures::{Poll, Stream};
 use futures::sync::mpsc::{unbounded as stream_channel, UnboundedSender, UnboundedReceiver};
 
-use rand::{Rand, Rng};
+use rand::{Rand, Rng, thread_rng};
 
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Sender, Receiver};
+use na::{Vector2};
+use std::time::{Duration, Instant};
+use futures::sync::oneshot;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use rand::ThreadRng;
+use std::cell::{Ref, RefCell};
+use std::ops::{Deref, DerefMut};
+use std::thread;
+
+type EntityId = u64;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Entity {
+    id: EntityId,
+    data: EntityAttribs,
+}
+
+/// Stores the "static" and "dynamic" attributes for entities, i.e. Players and Bullets.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum EntityAttribs {
+    Player {
+        attributes: PlayerData,
+        state: RefCell<PlayerState>,
+    },
+    Bullet {
+        attributes: BulletData,
+        state: RefCell<BulletState>,
+    },
+}
+impl EntityAttribs {
+    fn get_pos(&self) -> Option<Vec2> {
+        match *self {
+            EntityAttribs::Player { ref state, .. } => Some(state.borrow().pos),
+            EntityAttribs::Bullet { ref state, .. } => Some(state.borrow().pos),
+        }
+    }
+//    fn copy_state(&self) -> EntityState {
+//        match *self {
+//            EntityAttribs::Player { state, .. } => EntityState::Player(state),
+//            EntityAttribs::Bullet { state, .. } => EntityState::Bullet(state),
+//        }
+//    }
+//    fn borrow_state<'a>(&'a self) -> Ref<'a, EntityState> {
+//        match *self {
+//            EntityAttribs::Player { ref state, .. } => Ref::map(state.borrow(), |ps| &'a EntityState::Player(*ps)),
+//            EntityAttribs::Bullet { ref state, .. } => Ref::map(state.borrow(), |bs| &'a EntityState::Bullet(*bs)),
+//        }
+//    }
+    fn borrow_state<F, U>(&self, f: F) -> U
+        where F: Fn(EntityState) -> U
+    {
+        match *self {
+            EntityAttribs::Player { ref state, .. } => {
+                let player_state = state.borrow();
+                let ps = player_state.deref();
+                f(EntityState::Player(*ps))
+            },
+            EntityAttribs::Bullet { ref state, .. } => {
+                let bullet_state = state.borrow();
+                let bs = bullet_state.deref();
+                f(EntityState::Bullet(*bs))
+            }
+        }
+    }
+}
+
+/// Stores only the "dynamic" attributes of an entity.
+/// Used to reduce the number of bytes sent to clients for regular state updates.
+#[derive(Serialize, Deserialize, Debug)]
+pub enum EntityState {
+    Player(PlayerState),
+    Bullet(BulletState),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub enum Target {
+    Location(Vec2),
+    Entity(EntityId),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct Color([f64; 3]);
+impl Rand for Color {
+    fn rand<R: Rng>(rng: &mut R) -> Self {
+        Color([
+            rng.next_f64(),
+            rng.next_f64(),
+            rng.next_f64()
+        ])
+    }
+}
+
+/// Static attributes of a "player".
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct PlayerData {
+    speed: f64,
+    color: Color,
+    fire_cooldown: f64,
+}
+
+/// Dynamic attributes of a "player".
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct PlayerState {
+    pos: Vec2,
+    directive: PlayerDirective,
+    remaining_fire_cooldown: f64,
+}
+
+/// Static attributes of a "bullet"
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct BulletData {
+    vel: Vec2,
+    color: Color,
+}
+
+/// Dynamic attributes of a "bullet"
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct BulletState {
+    pos: Vec2,
+    remaining_life: Duration,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct Vec2{
+    x: f64,
+    y: f64,
+}
+impl Vec2 {
+    pub fn new(x: f64, y: f64) -> Vec2 {
+        Vec2{ x, y }
+    }
+    #[allow(unused)]
+    fn load(&mut self, v: Vector2<f64>) {
+        self.x = v.x;
+        self.y = v.y;
+    }
+    #[allow(unused)]
+    fn store(&self, v: &mut Vector2<f64>) {
+        v.x = self.x;
+        v.y = self.y;
+    }
+    fn to_vec(&self) -> Vector2<f64> {
+        Vector2::from([self.x, self.y])
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub enum PlayerDirective {
+    MovingToward(Target),
+    FiringAt(Target),
+    Idle,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct PlayerInput {
+    pub from: EntityId,
+    pub set_directive: PlayerDirective,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum GameStateUpdate {
+    Init(Entity),
+    Update(EntityId, EntityState)
+}
+
+pub struct ConnectedPlayer {
+    pawn_id: EntityId,
+    tx: UnboundedSender<GameStateUpdate>,
+    needs_inits: bool,
+}
+
+pub enum GameInput {
+    NewConnection {
+        entity_id_channel: oneshot::Sender<EntityId>,
+        updates_channel: UnboundedSender<GameStateUpdate>
+    },
+    Input(PlayerInput),
+}
+impl GameInput {
+    /// Create a new GameInput message representing a new client connection.
+    /// Returns a tuple containing the message as well as a Future that will resolve to the EntityId
+    /// assigned to the connection by the Game once the message is received.
+    pub fn new_connection(updates_channel: UnboundedSender<GameStateUpdate>) -> (GameInput, oneshot::Receiver<EntityId>) {
+        let (sender, receiver) = oneshot::channel();
+        let msg = GameInput::NewConnection {
+            entity_id_channel: sender,
+            updates_channel
+        };
+        (msg, receiver)
+    }
+}
+
+struct ToSpawn {
+    entity: Entity,
+    channel: Option<oneshot::Sender<EntityId>>
+}
+impl ToSpawn {
+    fn new(entity: Entity, channel: oneshot::Sender<EntityId>) -> ToSpawn {
+        ToSpawn { entity, channel: Some(channel) }
+    }
+}
+
+pub struct Game {
+    next_entity_id: EntityId,
+    clients: Vec<ConnectedPlayer>,
+    entity_ids: BTreeSet<EntityId>,
+    entities: BTreeMap<EntityId, Entity>,
+    spawn_queue: VecDeque<ToSpawn>,
+    inputs: Receiver<GameInput>,
+//    inputs_buffer: Vec<GameInput>,
+}
+impl Game {
+    pub fn new() -> (Game, Sender<GameInput>) {
+        let (sender, receiver) = channel();
+        let game = Game {
+            next_entity_id: 1,
+            clients: Vec::new(),
+            entity_ids: BTreeSet::new(),
+            entities: BTreeMap::new(),
+            spawn_queue: VecDeque::new(),
+            inputs: receiver,
+        };
+        (game, sender)
+    }
+
+    pub fn run(&mut self) {
+        let mut last_update_time = Instant::now();
+        let target_tick_rate = Duration::from_millis(8);
+        let dt = 0.008;
+
+        let mut countdown = 100;
+        loop {
+            let now = Instant::now();
+            let time_since_last = now - last_update_time;
+            if time_since_last < target_tick_rate {
+                continue;
+            }
+            last_update_time = now;
+            countdown -= 1;
+            if countdown >= 0 {
+                println!("waited {:?} to update", time_since_last)
+            }
+            self.tick(dt);
+        }
+    }
+
+    #[allow(unused)]
+    pub fn tick(&mut self, dt: f64) {
+        self.handle_inputs();
+
+        let mut scratch_vec_1 = Vector2::from([0.0, 0.0]);
+        let mut scratch_vec_2 = Vector2::from([0.0, 0.0]);
+
+        // tick the state of each entity that had already spawned
+        for id in self.entity_ids.iter() {
+            let entity = self.entities.get(id).unwrap();
+            match entity.data {
+                EntityAttribs::Player { ref attributes, ref state } => {
+                    let mut state = state.borrow_mut();
+                    let directive = state.directive;
+                    match directive {
+                        PlayerDirective::Idle => (),
+                        PlayerDirective::MovingToward(ref target) => {
+                            let target_pos = self.resolve_target_pos(entity,target);
+                            match target_pos {
+                                None => {
+                                    // player moving towards an entity with no position? Set it back to Idle
+                                    state.directive = PlayerDirective::Idle;
+                                },
+                                Some(ref dest) => {
+                                    let dest = dest.to_vec();
+                                    let mut pos = state.pos.to_vec();
+                                    let mut trajectory = dest - pos;
+                                    let speed = attributes.speed * dt;
+                                    match trajectory.try_normalize_mut(speed) {
+                                        None => {
+                                            // destination will be reached this tick
+                                            state.pos.load(dest);
+                                            state.directive = PlayerDirective::Idle;
+                                            println!("Entity {} reached its destination ({:?}) and became Idle", id, state.pos);
+                                        },
+                                        Some(_) => {
+                                            // update the position by scaling the trajectory by the speed
+                                            println!("Entity {} moving towards {:?} from {:?} at speed {}", id, dest, state.pos, speed);
+                                            trajectory *= speed;
+                                            pos += trajectory;
+                                            state.pos.load(pos);
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        PlayerDirective::FiringAt(target) => ()
+                    }
+                },
+                EntityAttribs::Bullet { ref attributes, ref state } => (),
+            };
+        }
+
+        // let all connected players know the current state
+        for (id, entity) in self.entities.iter() {
+            for client in self.clients.iter() {
+                if client.needs_inits {
+                    let e: Entity = (*entity).clone();
+                    client.tx.unbounded_send(GameStateUpdate::Init(e));
+                } else {
+                    let id = entity.id;
+                    let state = entity.data.borrow_state(|s| s);
+                    client.tx.unbounded_send(GameStateUpdate::Update(id, state));
+                }
+            }
+        }
+
+        // clear the `needs_inits` flag for all clients, now that we have sent any necessary init messages
+        for client in self.clients.iter_mut() {
+            client.needs_inits = false;
+        }
+
+        // pump the spawn queue into the entity collection, and let clients know
+        while let Some(to_spawn) = self.spawn_queue.pop_front() {
+            let entity = to_spawn.entity;
+            println!("Spawn {:?}", entity);
+            self.entity_ids.insert(entity.id);
+            self.entities.insert(entity.id, entity.clone());
+
+            let mut notify_state = Ok(());
+            if let Some(channel) = to_spawn.channel {
+                notify_state = channel.send(entity.id);
+            }
+            if notify_state.is_ok() {
+                for client in self.clients.iter() {
+                    client.tx.unbounded_send(GameStateUpdate::Init(entity.clone()));
+                }
+            } else {
+                self.entity_ids.remove(&entity.id);
+                self.entities.remove(&entity.id);
+                self.clients.retain(|client| client.pawn_id != entity.id)
+            }
+        }
+
+    }
+
+    fn index_and_broadcast_entity(&mut self, next_entity: Entity) {
+
+    }
+
+//    fn borrow_entity_state<F, U>(&self, current_entity: &Entity, id: EntityId, handler: F) -> U
+//        where F: Fn
+
+    fn resolve_target_pos(&self, from: &Entity, target: &Target) -> Option<Vec2> {
+        match *target {
+            Target::Location(vec) => Some(vec),
+            Target::Entity(id) if id == from.id => from.data.get_pos(),
+            Target::Entity(id) => self.entities.get(&id).and_then(|ref entity| entity.data.get_pos())
+        }
+    }
+
+//    fn resolve_target_pos(&self, target: &Target) -> Vec2 {
+//        match *target {
+//            Target::Location(vec) => vec,
+//            Target::Entity(ref id) => {
+//                match self.entities.get(id).unwrap().entity.get().data {
+//                    EntityAttribs::Player(_, ref state) => state.pos,
+//                    EntityAttribs::Bullet(_, ref state) => state.pos,
+//                }
+//            }
+//        }
+//    }
+
+    #[allow(unused)]
+    fn handle_inputs(&mut self) {
+        for input in self.inputs.try_iter() {
+            match input {
+
+                // Handle a new connection request.
+                GameInput::NewConnection { entity_id_channel, updates_channel } => {
+                    let entity_id = self.next_entity_id;
+                    self.next_entity_id += 1;
+
+                    // add a new client based on the connection information given
+                    self.clients.push(ConnectedPlayer {
+                        pawn_id: entity_id,
+                        tx: updates_channel,
+                        needs_inits: true
+                    });
+
+                    // create a new Player entity for the connected player
+                    let entity = Entity {
+                        id: entity_id,
+                        data: EntityAttribs::Player {
+                            attributes: PlayerData {
+                                speed: 300.0,
+                                color: thread_rng().gen(),
+                                fire_cooldown: 0.2
+                            },
+                            state: RefCell::new(PlayerState {
+                                pos: Vec2::new(0.0, 0.0),
+                                directive: PlayerDirective::Idle,
+                                remaining_fire_cooldown: 0.0
+                            })
+                        }
+                    };
+
+                    // Add the entity to the queue, providing the "entity_id_channel" as a means
+                    // of notifying the sender of this message that the entity has spawned.
+                    self.spawn_queue.push_back(ToSpawn::new(entity, entity_id_channel));
+                },
+
+                // Handle an input from a player
+                GameInput::Input(player_input) => {
+                    match self.entities.get(&player_input.from) {
+                        None => {
+                            println!("Got a player input associated with an entity that doesn't exist.");
+                        },
+                        Some(entity) => {
+                            let directive = player_input.set_directive;
+                            match entity.data {
+                                EntityAttribs::Player { ref state, .. } => {
+                                    let mut state_mut = state.borrow_mut();
+                                    state_mut.directive = directive;
+                                },
+                                _ => {
+                                    println!("Got a player input associated with a non-player entity");
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+}
+
+///-------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct GridPoint(pub i32, pub i32);
