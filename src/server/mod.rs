@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use tokio_core::net::TcpListener;
-use tokio_core::reactor::Core;
+use tokio_core::reactor::{Core, Handle};
 use tokio_io::{AsyncRead, AsyncWrite};
 
 pub fn run_game() {
@@ -29,26 +29,25 @@ pub fn run_game() {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
 
-    let (mut game, input_channel) = Game::new();
+    let (mut game, game_handle) = Game::new();
     thread::spawn(move || game.run());
 
-    let (client_send, client_recv) = stream_channel();
-    let (new_client_msg, client_id_future) = GameInput::new_connection(client_send);
+    let server = GameServer {
+        handle: Rc::new(game_handle)
+    };
 
-    input_channel.send(new_client_msg).unwrap();
-    let task = client_id_future.map_err(|_| ()).and_then(|id| {
-        let update = GameInput::Input(PlayerInput{
-            from: id,
-            set_directive: PlayerDirective::MovingToward(Target::Location(Vec2::new(300.0, 400.0)))
-        });
-        input_channel.send(update).unwrap();
-        client_recv.for_each(|update| {
-//            println!("update: {:?}", update);
-            Ok(())
-        })
+    // Set up a TCP listener that will accept new connections
+    let address = "0.0.0.0:12345".parse().unwrap();
+    let listener = TcpListener::bind(&address, &core.handle()).unwrap();
+
+    let run_server = listener.incoming().for_each(move |(socket, peer_addr)| {
+        Ok(server.handle_client(&handle, socket, peer_addr))
     });
 
-    core.run(task).unwrap();
+    match core.run(run_server) {
+        Ok(_) => (),
+        Err(_) => println!("Server crashed!"),
+    }
 }
 
 pub fn run() {
@@ -224,9 +223,52 @@ impl ClientRegistry {
     }
 }
 
+pub type GameIO<T> = BincodeIO<T, GameInput, GameStateUpdate>;
+pub type GameIn<T> = BincodeStream<T, GameInput>;
+pub type GameOut<T> = BincodeSink<T, GameStateUpdate>;
+
+struct GameIOMessages;
+impl IOMessages for GameIOMessages {
+    type Input = GameInput;
+    type Output = GameStateUpdate;
+}
+
 pub type ServerIO<T> = BincodeIO<T, GridClientRequest, GridClientResponse>;
 pub type ServerIn<T> = BincodeStream<T, GridClientRequest>;
 pub type ServerOut<T> = BincodeSink<T, GridClientResponse>;
+
+struct GameServer {
+    handle: Rc<GameHandle>,
+}
+impl GameServer {
+    fn handle_client<T>(&self, handle: &Handle, socket: T, addr: SocketAddr) -> ()
+        where T: AsyncRead + AsyncWrite + 'static
+    {
+        // channel for sending messages from the Game to the Client
+        let (client_send, client_recv) = stream_channel();
+        let game_handle = self.handle.clone();
+
+        let handler = self.handle.new_connection(client_send).map_err(|_| ()).and_then(|client_id| {
+            let (socket_send, socket_recv) = BincodeIO::new(socket, GameIOMessages).split();
+
+            let handle_send = socket_send.send_all(client_recv.map_err(|_| fake_io_error("failed to receive message")))
+                .map(|_| ())
+                .map_err(|_| ());
+
+            let handle_recv = socket_recv.for_each(move |game_input| {
+                game_handle.send(game_input);
+                Ok(())
+            }).map_err(|_| ());
+
+            handle_send.select(handle_recv)
+                .map(|_| ())
+                .map_err(|_| ())
+
+        });
+
+        handle.spawn(handler);
+    }
+}
 
 struct ServerIOMessages;
 impl IOMessages for ServerIOMessages {
