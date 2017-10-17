@@ -19,7 +19,6 @@ extern crate input;
 extern crate nalgebra as na;
 
 mod game;
-mod client;
 mod server;
 mod ui;
 mod binio;
@@ -30,7 +29,6 @@ fn main() {
 
     match arg1_ref {
         Some("server") => server::run(),
-        Some("client") => client::run(),
         Some("ui") => ui::run(),
         Some("game") => server::run_game(),
         _ => println!("Argument should be either 'server' or 'client'"),

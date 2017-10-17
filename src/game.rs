@@ -363,11 +363,9 @@ impl Game {
                                             // destination will be reached this tick
                                             state.pos.load(dest);
                                             state.directive = PlayerDirective::Idle;
-                                            println!("Entity {} reached its destination ({:?}) and became Idle", id, state.pos);
                                         },
                                         Some(_) => {
                                             // update the position by scaling the trajectory by the speed
-                                            println!("Entity {} moving towards {:?} from {:?} at speed {}", id, dest, state.pos, speed);
                                             trajectory *= speed;
                                             pos += trajectory;
                                             state.pos.load(pos);
