@@ -28,9 +28,8 @@ fn main() {
     let arg1_ref: Option<&str> = arg1.as_ref().map(String::as_ref);
 
     match arg1_ref {
-        Some("server") => server::run(),
-        Some("ui") => ui::run(),
-        Some("game") => server::run_game(),
+        Some("server") => server::run_game(),
+        Some("client") => ui::run(),
         _ => println!("Argument should be either 'server' or 'client'"),
     }
 }
