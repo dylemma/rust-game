@@ -18,6 +18,7 @@ use std::rc::Rc;
 use std::str;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::SendError;
 use std::thread;
 
 use tokio_core::net::TcpListener;
@@ -250,23 +251,56 @@ impl GameServer {
 
         let io = BincodeIO::new(socket, GameIOMessages);
 
-        let handler = self.handle.new_connection(client_send).map_err(|_| ()).and_then(|client_id| {
-            io.write_one(GameStateUpdate::SetClientId(client_id)).map_err(|_| ()).and_then(|io| {
+        let client_id_future: Box<Future<Item = EntityId, Error = ()>> = Box::new(
+            future::result(self.handle.new_connection(client_send))
+            .map_err(|_| {
+                println!("Failed to notify server of new connection. Game must be shutting down");
+            })
+            .and_then(|receiver| {
+                receiver.map_err(|_| println!("Game cancelled receipt of new connection"))
+            })
+        );
+
+        let handler = client_id_future.and_then(|client_id| {
+            io.write_one(GameStateUpdate::SetClientId(client_id)).map_err(|_| ()).and_then(move |io| {
                 let (socket_send, socket_recv) = io.split();
 
-                let handle_send = socket_send.send_all(client_recv.map_err(|_| fake_io_error("failed to receive message")))
-                    .map(|_| println!("Finished sending?!"))
-                    .map_err(|e| println!("Error sending msg to client {:?}", e));
+                let state_updates_broadcast = client_recv
+                    .map_err(|_| {
+                        // upgrade error type to io::Error so we can use send_all
+                        fake_io_error("Error in UnboundedReceiver stream.")
+                    });
 
-                let handle_recv = socket_recv.for_each(move |game_input| {
-                    game_handle.send(game_input);
-                    Ok(())
-                }).map_err(|e| println!("Error receiving message from client {:?}", e));
+                // Send all of the StateUpdates to the client over the socket.
+                // An error here means the client disconnected.
+                let handle_send = socket_send.send_all(state_updates_broadcast)
+                    .map(|_| ())
+                    .map_err(|e| ());
 
+                // Read all messages from the client from the socket, and pass them along to the game.
+                // An error reading from the socket means the client disconnected.
+                // An error sending to the game means the game has shut down.
+                let game_handle_for_recv = game_handle.clone();
+                let handle_recv = {
+                    socket_recv
+                        .map_err(|e| ())
+                        .for_each(move |game_input| {
+                            game_handle_for_recv.send(game_input).map_err(move |SendError(unsent_input)| {
+                                println!("Failed to send {:?} to the game from client {}. Game must be shutting down", unsent_input, client_id);
+                            })
+                        })
+                };
+
+                // Get the first completed (success or failure)
+                let game_handle_for_finish = game_handle.clone();
                 handle_send.select(handle_recv)
                     .map(|_| ())
                     .map_err(|_| ())
-
+                    .then(move |_| {
+                        game_handle_for_finish.dropped_connection(client_id).map_err(move |_| {
+                            println!("Failed to notify server of client {}'s disconnection. Game must be shutting down", client_id);
+                        })
+                    })
             })
         });
 

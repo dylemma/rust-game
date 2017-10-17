@@ -4,7 +4,7 @@ use futures::sync::mpsc::{unbounded as stream_channel, UnboundedSender, Unbounde
 use rand::{Rand, Rng, thread_rng};
 
 use std::rc::Rc;
-use std::sync::mpsc::{channel, Sender, Receiver};
+use std::sync::mpsc::{channel, Sender, SendError, Receiver};
 use na::{Vector2};
 use std::time::{Duration, Instant};
 use futures::sync::oneshot;
@@ -189,7 +189,8 @@ pub struct PlayerInput {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum GameStateUpdate {
     SetClientId(EntityId),
-    Init(Entity),
+    Spawn(Entity),
+    Despawn(EntityId),
     Update(EntityId, EntityState)
 }
 
@@ -198,37 +199,18 @@ pub struct ConnectedPlayer {
     tx: UnboundedSender<GameStateUpdate>,
     needs_inits: bool,
 }
-pub struct NewConnection {
-    entity_id_channel: oneshot::Sender<EntityId>,
-    updates_channel: UnboundedSender<GameStateUpdate>
+
+enum ConnectionStateChange {
+    NewConnection {
+        entity_id_channel: oneshot::Sender<EntityId>,
+        updates_channel: UnboundedSender<GameStateUpdate>
+    },
+    Dropped(EntityId)
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum GameInput {
     Input(PlayerInput),
-}
-//impl GameInput {
-//    /// Create a new GameInput message representing a new client connection.
-//    /// Returns a tuple containing the message as well as a Future that will resolve to the EntityId
-//    /// assigned to the connection by the Game once the message is received.
-//    pub fn new_connection(updates_channel: UnboundedSender<GameStateUpdate>) -> (GameInput, oneshot::Receiver<EntityId>) {
-//        let (sender, receiver) = oneshot::channel();
-//        let msg = GameInput::NewConnection {
-//            entity_id_channel: sender,
-//            updates_channel
-//        };
-//        (msg, receiver)
-//    }
-//}
-
-struct ToSpawn {
-    entity: Entity,
-    channel: Option<oneshot::Sender<EntityId>>
-}
-impl ToSpawn {
-    fn new(entity: Entity, channel: oneshot::Sender<EntityId>) -> ToSpawn {
-        ToSpawn { entity, channel: Some(channel) }
-    }
 }
 
 trait Sleeper {
@@ -248,31 +230,44 @@ impl Sleeper for TokioTimer {
 
 pub struct GameHandle {
     input_sender: Sender<GameInput>,
-    connection_sender: Sender<NewConnection>,
+    connection_sender: Sender<ConnectionStateChange>,
 }
 impl GameHandle {
-    pub fn send(&self, input: GameInput) -> () {
-        self.input_sender.send(input).unwrap();
+    pub fn send(&self, input: GameInput) -> Result<(), SendError<GameInput>> {
+        self.input_sender.send(input)
     }
-    pub fn new_connection(&self, updates_channel: UnboundedSender<GameStateUpdate>) -> oneshot::Receiver<EntityId> {
+    pub fn new_connection(&self, updates_channel: UnboundedSender<GameStateUpdate>) -> Result<oneshot::Receiver<EntityId>, SendError<UnboundedSender<GameStateUpdate>>> {
         let (sender, receiver) = oneshot::channel();
-        let msg = NewConnection {
+        let msg = ConnectionStateChange::NewConnection {
             entity_id_channel: sender,
             updates_channel
         };
-        self.connection_sender.send(msg);
-        receiver
+        self.connection_sender.send(msg)
+            .map_err(|msg| {
+                SendError(match msg.0 {
+                    ConnectionStateChange::NewConnection { updates_channel, .. } => updates_channel,
+                    _ => unreachable!(),
+                })
+            })
+            .map(|_| receiver)
+    }
+    pub fn dropped_connection(&self, entity_id: EntityId) -> Result<(), SendError<()>> {
+        let msg = ConnectionStateChange::Dropped(entity_id);
+        self.connection_sender.send(msg).map_err(|_| SendError(()))
     }
 }
+
+
 
 pub struct Game {
     next_entity_id: EntityId,
     clients: Vec<ConnectedPlayer>,
     entity_ids: BTreeSet<EntityId>,
     entities: BTreeMap<EntityId, Entity>,
-    spawn_queue: VecDeque<ToSpawn>,
+    spawn_queue: VecDeque<Entity>,
+    despawn_queue: VecDeque<EntityId>,
     inputs: Receiver<GameInput>,
-    inc_connections: Receiver<NewConnection>,
+    connections_changes: Receiver<ConnectionStateChange>,
 }
 impl Game {
     pub fn new() -> (Game, GameHandle) {
@@ -284,8 +279,9 @@ impl Game {
             entity_ids: BTreeSet::new(),
             entities: BTreeMap::new(),
             spawn_queue: VecDeque::new(),
+            despawn_queue: VecDeque::new(),
             inputs: input_receiver,
-            inc_connections: connection_receiver,
+            connections_changes: connection_receiver,
         };
         (game, GameHandle { input_sender, connection_sender })
     }
@@ -331,6 +327,15 @@ impl Game {
     pub fn tick(&mut self, dt: f64) {
         self.handle_connections();
         self.handle_inputs();
+
+        while let Some(to_despawn) = self.despawn_queue.pop_front() {
+            let did_despawn = self.entities.remove(&to_despawn).is_some();
+            self.entity_ids.remove(&to_despawn);
+
+            for client in self.clients.iter() {
+                client.tx.unbounded_send(GameStateUpdate::Despawn(to_despawn));
+            }
+        }
 
         let mut scratch_vec_1 = Vector2::from([0.0, 0.0]);
         let mut scratch_vec_2 = Vector2::from([0.0, 0.0]);
@@ -386,7 +391,7 @@ impl Game {
             for client in self.clients.iter() {
                 if client.needs_inits {
                     let e: Entity = (*entity).clone();
-                    client.tx.unbounded_send(GameStateUpdate::Init(e));
+                    client.tx.unbounded_send(GameStateUpdate::Spawn(e));
                 } else {
                     let id = entity.id;
                     let state = entity.data.borrow_state(|s| s);
@@ -401,35 +406,17 @@ impl Game {
         }
 
         // pump the spawn queue into the entity collection, and let clients know
-        while let Some(to_spawn) = self.spawn_queue.pop_front() {
-            let entity = to_spawn.entity;
+        while let Some(entity) = self.spawn_queue.pop_front() {
             println!("Spawn {:?}", entity);
             self.entity_ids.insert(entity.id);
             self.entities.insert(entity.id, entity.clone());
 
-            let mut notify_state = Ok(());
-            if let Some(channel) = to_spawn.channel {
-                notify_state = channel.send(entity.id);
-            }
-            if notify_state.is_ok() {
-                for client in self.clients.iter() {
-                    client.tx.unbounded_send(GameStateUpdate::Init(entity.clone()));
-                }
-            } else {
-                self.entity_ids.remove(&entity.id);
-                self.entities.remove(&entity.id);
-                self.clients.retain(|client| client.pawn_id != entity.id)
+            for client in self.clients.iter() {
+                client.tx.unbounded_send(GameStateUpdate::Spawn(entity.clone()));
             }
         }
 
     }
-
-    fn index_and_broadcast_entity(&mut self, next_entity: Entity) {
-
-    }
-
-//    fn borrow_entity_state<F, U>(&self, current_entity: &Entity, id: EntityId, handler: F) -> U
-//        where F: Fn
 
     fn resolve_target_pos(&self, from: &Entity, target: &Target) -> Option<Vec2> {
         match *target {
@@ -439,53 +426,58 @@ impl Game {
         }
     }
 
-//    fn resolve_target_pos(&self, target: &Target) -> Vec2 {
-//        match *target {
-//            Target::Location(vec) => vec,
-//            Target::Entity(ref id) => {
-//                match self.entities.get(id).unwrap().entity.get().data {
-//                    EntityAttribs::Player(_, ref state) => state.pos,
-//                    EntityAttribs::Bullet(_, ref state) => state.pos,
-//                }
-//            }
-//        }
-//    }
-
     fn handle_connections(&mut self) {
-        for new_conn in self.inc_connections.try_iter() {
-            let NewConnection { entity_id_channel, updates_channel } = new_conn;
+        for connection_state_change in self.connections_changes.try_iter() {
+            match connection_state_change {
+                ConnectionStateChange::NewConnection { entity_id_channel, updates_channel } => {
+                    let entity_id = self.next_entity_id;
+                    self.next_entity_id += 1;
 
-            let entity_id = self.next_entity_id;
-            self.next_entity_id += 1;
+                    match entity_id_channel.send(entity_id) {
+                        Err(unsent_id) => {
+                            // connection must have dropped already. Don't add the entity; reuse the id.
+                            self.next_entity_id = unsent_id;
+                        },
+                        Ok(()) => {
+                            // add a new client based on the connection information given
+                            self.clients.push(ConnectedPlayer {
+                                pawn_id: entity_id,
+                                tx: updates_channel,
+                                needs_inits: true
+                            });
 
-            // add a new client based on the connection information given
-            self.clients.push(ConnectedPlayer {
-                pawn_id: entity_id,
-                tx: updates_channel,
-                needs_inits: true
-            });
+                            // create a new Player entity for the connected player
+                            let entity = Entity {
+                                id: entity_id,
+                                data: EntityAttribs::Player {
+                                    attributes: PlayerData {
+                                        speed: 300.0,
+                                        color: thread_rng().gen(),
+                                        fire_cooldown: 0.2
+                                    },
+                                    state: RefCell::new(PlayerState {
+                                        pos: Vec2::new(0.0, 0.0),
+                                        directive: PlayerDirective::Idle,
+                                        remaining_fire_cooldown: 0.0
+                                    })
+                                }
+                            };
 
-            // create a new Player entity for the connected player
-            let entity = Entity {
-                id: entity_id,
-                data: EntityAttribs::Player {
-                    attributes: PlayerData {
-                        speed: 300.0,
-                        color: thread_rng().gen(),
-                        fire_cooldown: 0.2
-                    },
-                    state: RefCell::new(PlayerState {
-                        pos: Vec2::new(0.0, 0.0),
-                        directive: PlayerDirective::Idle,
-                        remaining_fire_cooldown: 0.0
-                    })
+                            // Add the entity to the queue, providing the "entity_id_channel" as a means
+                            // of notifying the sender of this message that the entity has spawned.
+                            self.spawn_queue.push_back(entity);
+
+                        },
+                    }
+
+                },
+                ConnectionStateChange::Dropped(entity_id) => {
+                    self.clients.retain(|client| client.pawn_id != entity_id);
+                    self.despawn_queue.push_back(entity_id);
                 }
-            };
-
-            // Add the entity to the queue, providing the "entity_id_channel" as a means
-            // of notifying the sender of this message that the entity has spawned.
-            self.spawn_queue.push_back(ToSpawn::new(entity, entity_id_channel));
+            }
         }
+
     }
 
     #[allow(unused)]

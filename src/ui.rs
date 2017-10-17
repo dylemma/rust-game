@@ -137,10 +137,14 @@ pub fn run() {
                 for update in update_recv.try_iter() {
                     match update {
                         GameStateUpdate::SetClientId(_) => (),
-                        GameStateUpdate::Init(entity) => {
+                        GameStateUpdate::Spawn(entity) => {
                             println!("Init entity: {:?}", entity);
                             entities.insert(entity.id, entity);
                         },
+                        GameStateUpdate::Despawn(entity_id) => {
+                            println!("Despawn entity: {}", entity_id);
+                            entities.remove(&entity_id);
+                        }
                         GameStateUpdate::Update(id, state) => {
                             entities.get(&id).unwrap().data.set_state(state);
                         },
