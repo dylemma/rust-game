@@ -1,20 +1,19 @@
-use piston_window::*;
-use graphics::ellipse;
-use na::{Vector2};
-use fps_counter::FPSCounter;
-use std::time::Instant;
-use std::sync::mpsc::channel;
 use binio::*;
-use game;
 use game::*;
+
+use futures::{future, Future, Sink, Stream};
+use futures::sync::mpsc::{unbounded as stream_channel};
+
+use graphics::ellipse;
+use piston_window::*;
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::sync::mpsc::channel;
+use std::thread;
+
 use tokio_core::net::TcpStream;
 use tokio_core::reactor::Core;
-use std::net::SocketAddr;
-use std::thread;
-use futures::future;
-use futures::{Future, Sink, Stream};
-use futures::sync::mpsc::{unbounded as stream_channel};
-use std::collections::BTreeMap;
 
 struct GameClientIOMessages;
 impl IOMessages for GameClientIOMessages {
@@ -82,17 +81,12 @@ pub fn run() {
 
     // let chara
     let character_radius = 10.0;
-    let character = Ellipse::new([0.0, 0.8, 0.3, 1.0]);
     let character_border = Ellipse::new_border([0.5, 0.5, 0.5, 1.0], 0.5);
 
     // values related to mouse-based character movement
-    let mut character_pos = [100.0, 100.0];
-    let mut character_target = [100.0, 100.0];
     let mut mouse_pos = [0.0, 0.0];
     let mut is_mouse_down = false;
-    let follow_speed = 300.0;
 
-    let mut fps_counter = FPSCounter::new();
     let mut updated_since_render = false;
 
     let mut entities = BTreeMap::<EntityId, Entity>::new();
@@ -104,10 +98,8 @@ pub fn run() {
             mouse_pos[0] = x;
             mouse_pos[1] = y;
             if is_mouse_down {
-                character_target[0] = x;
-                character_target[1] = y;
                 let directive = PlayerDirective::MovingToward(Target::Location(Vec2::new(x, y)));
-                input_send.unbounded_send(directive);
+                input_send.unbounded_send(directive).unwrap();
             }
         });
 
@@ -118,10 +110,8 @@ pub fn run() {
                     match btn.state {
                         ButtonState::Press => {
                             is_mouse_down = true;
-                            character_target[0] = mouse_pos[0];
-                            character_target[1] = mouse_pos[1];
                             let directive = PlayerDirective::MovingToward(Target::Location(Vec2::new(mouse_pos[0], mouse_pos[1])));
-                            input_send.unbounded_send(directive);
+                            input_send.unbounded_send(directive).unwrap();
                         },
                         ButtonState::Release => is_mouse_down = false
                     }
@@ -130,7 +120,7 @@ pub fn run() {
             }
         });
 
-        event.update(|&args| {
+        event.update(|_| {
             if !updated_since_render {
                 updated_since_render = true;
 
@@ -150,19 +140,6 @@ pub fn run() {
                         },
                     }
                 }
-
-
-//                let dt = args.dt;
-//                let dist = dt * follow_speed;
-//                let mut movement: Vector2<f64> = Vector2::from(character_target) - Vector2::from(character_pos);
-//                if movement.try_normalize_mut(1.0).is_some() {
-//                    movement *= dist;
-//                    character_pos[0] += movement.x;
-//                    character_pos[1] += movement.y;
-//                }
-
-//                let fps = fps_counter.tick();
-//                println!("{} fps", fps);
             }
         });
 
@@ -193,7 +170,7 @@ pub fn run() {
                             circle.draw(circle_bounds, &draw_state, context.transform, graphics);
                             character_border.draw(circle_bounds, &draw_state, context.transform, graphics);
                         },
-                        EntityAttribs::Bullet { ref attributes, ref state } => (),
+                        EntityAttribs::Bullet { .. } => (),
                     }
                 }
 

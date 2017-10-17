@@ -1,18 +1,17 @@
 use futures::{Future, Poll, Stream};
 use futures::sync::mpsc::{unbounded as stream_channel, UnboundedSender, UnboundedReceiver};
+use futures::sync::oneshot;
 
+use na::{Vector2};
 use rand::{Rand, Rng, thread_rng};
 
+use std::cell::{RefCell};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Sender, SendError, Receiver};
-use na::{Vector2};
 use std::time::{Duration, Instant};
-use futures::sync::oneshot;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use rand::ThreadRng;
-use std::cell::{Ref, RefCell};
-use std::ops::{Deref, DerefMut};
-use std::thread;
+
 use tokio_timer::{Timer, wheel};
 
 pub type EntityId = u64;
@@ -292,11 +291,9 @@ impl Game {
             .max_timeout(Duration::from_millis(10))
             .build());
 
-        let mut last_update_time = Instant::now();
         let target_tick_rate = Duration::from_millis(8);
         let dt = 0.008;
 
-        let mut countdown = 200;
         loop {
             let before_tick = Instant::now();
             let next_tick_time = before_tick + target_tick_rate;

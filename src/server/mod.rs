@@ -224,10 +224,6 @@ impl ClientRegistry {
     }
 }
 
-pub type GameIO<T> = BincodeIO<T, GameInput, GameStateUpdate>;
-pub type GameIn<T> = BincodeStream<T, GameInput>;
-pub type GameOut<T> = BincodeSink<T, GameStateUpdate>;
-
 pub struct GameIOMessages;
 impl IOMessages for GameIOMessages {
     type Input = GameInput;
@@ -242,7 +238,7 @@ struct GameServer {
     handle: Rc<GameHandle>,
 }
 impl GameServer {
-    fn handle_client<T>(&self, handle: &Handle, socket: T, addr: SocketAddr) -> ()
+    fn handle_client<T>(&self, handle: &Handle, socket: T, _addr: SocketAddr) -> ()
         where T: AsyncRead + AsyncWrite + 'static
     {
         // channel for sending messages from the Game to the Client
@@ -275,7 +271,7 @@ impl GameServer {
                 // An error here means the client disconnected.
                 let handle_send = socket_send.send_all(state_updates_broadcast)
                     .map(|_| ())
-                    .map_err(|e| ());
+                    .map_err(|_| ());
 
                 // Read all messages from the client from the socket, and pass them along to the game.
                 // An error reading from the socket means the client disconnected.
@@ -283,7 +279,7 @@ impl GameServer {
                 let game_handle_for_recv = game_handle.clone();
                 let handle_recv = {
                     socket_recv
-                        .map_err(|e| ())
+                        .map_err(|_| ())
                         .for_each(move |game_input| {
                             game_handle_for_recv.send(game_input).map_err(move |SendError(unsent_input)| {
                                 println!("Failed to send {:?} to the game from client {}. Game must be shutting down", unsent_input, client_id);
