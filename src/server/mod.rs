@@ -20,8 +20,8 @@ pub fn run_game() {
     let mut core = Core::new().unwrap();
     let handle = core.handle();
 
-    let (mut game, game_handle) = Game::new();
-    thread::spawn(move || game.run());
+    let (game_start_handle, game_handle) = Game::new();
+    game_start_handle.start();
 
     let server = GameServer {
         handle: Rc::new(game_handle)

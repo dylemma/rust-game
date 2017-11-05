@@ -89,7 +89,7 @@ pub fn run() {
 
     let mut updated_since_render = false;
 
-    let mut entities = BTreeMap::<EntityId, Entity>::new();
+    let mut entities = BTreeMap::<EntityId, ActorInitMemo>::new();
 
     while let Some(event) = window.next() {
 
@@ -127,16 +127,16 @@ pub fn run() {
                 for update in update_recv.try_iter() {
                     match update {
                         GameStateUpdate::SetClientId(_) => (),
-                        GameStateUpdate::Spawn(entity) => {
+                        GameStateUpdate::Spawn(id, entity) => {
                             println!("Init entity: {:?}", entity);
-                            entities.insert(entity.id, entity);
+                            entities.insert(id, entity);
                         },
                         GameStateUpdate::Despawn(entity_id) => {
                             println!("Despawn entity: {}", entity_id);
                             entities.remove(&entity_id);
                         }
                         GameStateUpdate::Update(id, state) => {
-                            entities.get(&id).unwrap().data.set_state(state);
+                            entities.get_mut(&id).unwrap().set_state(state);
                         },
                     }
                 }
@@ -151,7 +151,6 @@ pub fn run() {
                 args.height as f64 - border_margin
             );
 
-//            let character_dims = ellipse::circle(character_pos[0], character_pos[1], character_radius);
             let draw_state = DrawState::default();
 
             window.draw_2d(&event, |context, graphics| {
@@ -159,10 +158,9 @@ pub fn run() {
                 clear([1.0; 4], graphics);
                 border.draw(border_dims, &draw_state, context.transform, graphics);
 
-                for entity in entities.values() {
-                    match entity.data {
-                        EntityAttribs::Player{ ref attributes, ref state } => {
-                            let state = state.borrow();
+                for entity in entities.values_mut() {
+                    match *entity {
+                        ActorInitMemo::Player(ref mut state, ref attributes) => {
                             let pos = state.pos;
                             let circle = Ellipse::new(attributes.color.to_vec4());
                             let circle_bounds = ellipse::circle(pos.x, pos.y, character_radius);
@@ -170,7 +168,6 @@ pub fn run() {
                             circle.draw(circle_bounds, &draw_state, context.transform, graphics);
                             character_border.draw(circle_bounds, &draw_state, context.transform, graphics);
                         },
-                        EntityAttribs::Bullet { .. } => (),
                     }
                 }
 
