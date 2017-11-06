@@ -1,5 +1,7 @@
 use binio::*;
 use game::*;
+use game::actor::*;
+use game::actor::player::*;
 
 use futures::{future, Future, Sink, Stream};
 use futures::sync::mpsc::{unbounded as stream_channel};

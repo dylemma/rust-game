@@ -9,7 +9,6 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::str;
 use std::sync::mpsc::SendError;
-use std::thread;
 
 use tokio_core::net::TcpListener;
 use tokio_core::reactor::{Core, Handle};

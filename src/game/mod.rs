@@ -1,3 +1,5 @@
+pub mod actor;
+
 use futures::Future;
 use futures::sync::mpsc::UnboundedSender;
 use futures::sync::oneshot;
@@ -7,7 +9,6 @@ use rand::{Rand, Rng, thread_rng};
 
 use std::cell::{RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::ops::Deref;
 use std::sync::{Arc, Mutex, Condvar};
 use std::sync::mpsc::{channel, Sender, SendError, Receiver};
 use std::thread;
@@ -15,75 +16,10 @@ use std::time::{Duration, Instant};
 
 use tokio_timer::{Timer, wheel};
 
+use self::actor::*;
+use self::actor::player::*;
+
 pub type EntityId = u64;
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Entity {
-    pub id: EntityId,
-    pub data: EntityAttribs,
-}
-
-/// Stores the "static" and "dynamic" attributes for entities, i.e. Players and Bullets.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum EntityAttribs {
-    Player {
-        attributes: PlayerData,
-        state: RefCell<PlayerState>,
-    },
-    Bullet {
-        attributes: BulletData,
-        state: RefCell<BulletState>,
-    },
-}
-impl EntityAttribs {
-    fn get_pos(&self) -> Option<Vec2> {
-        match *self {
-            EntityAttribs::Player { ref state, .. } => Some(state.borrow().pos),
-            EntityAttribs::Bullet { ref state, .. } => Some(state.borrow().pos),
-        }
-    }
-
-    fn borrow_state<F, U>(&self, f: F) -> U
-        where F: Fn(EntityState) -> U
-    {
-        match *self {
-            EntityAttribs::Player { ref state, .. } => {
-                let player_state = state.borrow();
-                let ps = player_state.deref();
-                f(EntityState::Player(*ps))
-            },
-            EntityAttribs::Bullet { ref state, .. } => {
-                let bullet_state = state.borrow();
-                let bs = bullet_state.deref();
-                f(EntityState::Bullet(*bs))
-            }
-        }
-    }
-
-    pub fn set_state(&self, new_state: EntityState) {
-        match (self, new_state) {
-            (&EntityAttribs::Player { ref state, .. }, EntityState::Player(ps)) => {
-                let mut s = state.borrow_mut();
-                *s = ps;
-            },
-            (&EntityAttribs::Bullet { ref state, .. }, EntityState::Bullet(bs)) => {
-                let mut s = state.borrow_mut();
-                *s = bs;
-            },
-            _ => {
-                println!("invalid input to set_state (wrong type)");
-            }
-        }
-    }
-}
-
-/// Stores only the "dynamic" attributes of an entity.
-/// Used to reduce the number of bytes sent to clients for regular state updates.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-pub enum EntityState {
-    Player(PlayerState),
-    Bullet(BulletState),
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub enum Target {
@@ -108,21 +44,7 @@ impl Color {
     }
 }
 
-/// Static attributes of a "player".
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-pub struct PlayerData {
-    pub max_speed: f64,
-    pub color: Color,
-    pub fire_cooldown: f64,
-}
 
-/// Dynamic attributes of a "player".
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-pub struct PlayerState {
-    pub pos: Vec2,
-    pub directive: PlayerDirective,
-    pub remaining_fire_cooldown: f64,
-}
 
 /// Static attributes of a "bullet"
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
@@ -160,19 +82,6 @@ impl Vec2 {
     fn to_vec(&self) -> Vector2<f64> {
         Vector2::from([self.x, self.y])
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-pub enum PlayerDirective {
-    MovingToward(Target),
-    FiringAt(Target),
-    Idle,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct PlayerInput {
-    pub from: EntityId,
-    pub set_directive: PlayerDirective,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -263,7 +172,7 @@ impl PositionQueryResult {
     }
 }
 
-struct ActorGameHandle<'a> {
+pub struct ActorGameHandle<'a> {
     id: EntityId,
     game: &'a Game,
 }
@@ -282,114 +191,6 @@ impl <'a> ActorGameHandle<'a> {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-pub enum ActorInitMemo {
-    Player(PlayerState, PlayerData),
-}
-impl ActorInitMemo {
-    pub fn set_state(&mut self, state: EntityState) -> () {
-        match (*self, state) {
-            (ActorInitMemo::Player(_, data), EntityState::Player(player_state)) => *self = ActorInitMemo::Player(player_state, data),
-            (memo, state) => panic!("State cannot be applied to this object: {:?} into {:?}", state, memo)
-        }
-    }
-}
-
-trait GameActor {
-    fn to_init_memo(&self) -> ActorInitMemo;
-    fn on_spawn(&mut self) -> ();
-    fn on_player_input(&mut self, input: &PlayerInput) -> ();
-    fn tick<'a>(&mut self, dt: f64, game_handle: ActorGameHandle<'a>) -> Option<EntityState>;
-    fn get_pos(&self) -> Vec2;
-}
-
-struct ActorRef {
-    actor: RefCell<Box<GameActor>>,
-}
-impl ActorRef {
-    fn to_init_memo(&self) -> ActorInitMemo {
-        self.actor.borrow().to_init_memo()
-    }
-    fn get_pos(&self) -> Vec2 {
-        self.actor.borrow().deref().get_pos()
-    }
-    fn on_player_input(&self, input: &PlayerInput) -> () {
-        self.actor.borrow_mut().on_player_input(input);
-    }
-    fn tick<'a>(&self, dt: f64, game_handle: ActorGameHandle<'a>) -> Option<EntityState> {
-        self.actor.borrow_mut().tick(dt, game_handle)
-    }
-}
-
-#[derive(Debug)]
-struct PlayerActor {
-    state: PlayerState,
-    attributes: PlayerData,
-}
-
-
-impl GameActor for PlayerActor {
-    fn to_init_memo(&self) -> ActorInitMemo {
-        ActorInitMemo::Player(self.state, self.attributes)
-    }
-
-    fn on_spawn(&mut self) -> () {
-        println!("Spawn {:?}", *self);
-    }
-
-    fn on_player_input(&mut self, input: &PlayerInput) -> () {
-        self.state.directive = input.set_directive;
-    }
-
-    fn tick<'a>(&mut self, dt: f64, game_handle: ActorGameHandle<'a>) -> Option<EntityState> {
-        let current_directive = self.state.directive;
-        match current_directive {
-            PlayerDirective::Idle => {
-                // nothing will change
-                None
-            },
-            PlayerDirective::MovingToward(ref target) => {
-                let target_pos = game_handle.resolve_target_pos(target).resolve(self);
-                match target_pos {
-                    None => {
-                        // player moving towards an entity with no position? Set it back to Idle
-                        self.state.directive = PlayerDirective::Idle;
-                    },
-                    Some(ref dest) => {
-                        let dest = dest.to_vec();
-                        let mut pos = self.state.pos.to_vec();
-                        let mut trajectory = dest - pos;
-                        let speed = self.attributes.max_speed * dt;
-                        match trajectory.try_normalize_mut(speed) {
-                            None => {
-                                // destination will be reached this tick
-                                self.state.pos.load(dest);
-                                self.state.directive = PlayerDirective::Idle;
-                            },
-                            Some(_) => {
-                                // update the position by scaling the trajectory by the speed
-                                trajectory *= speed;
-                                pos += trajectory;
-                                self.state.pos.load(pos);
-                            }
-                        }
-                    }
-                };
-                Some(EntityState::Player(self.state))
-            },
-            PlayerDirective::FiringAt(target) => {
-                // TODO: implement firing directive
-                unimplemented!();
-                Some(EntityState::Player(self.state))
-            }
-        }
-    }
-
-    fn get_pos(&self) -> Vec2 {
-        self.state.pos
-    }
-
-}
 
 /// Handle for starting the game loop thread.
 ///
@@ -540,9 +341,7 @@ impl Game {
             entity.on_spawn();
             self.entity_ids.insert(id);
             let init_memo = entity.to_init_memo();
-            self.actors.insert(id, ActorRef {
-                actor: RefCell::new(entity),
-            });
+            self.actors.insert(id, ActorRef::new(entity));
 
             for client in self.clients.iter() {
                 client.tx.unbounded_send(GameStateUpdate::Spawn(id, init_memo));
@@ -572,18 +371,18 @@ impl Game {
                             });
 
                             // create a new Player entity for the connected player
-                            let player_actor = PlayerActor {
-                                attributes: PlayerData {
+                            let player_actor = PlayerActor::new(
+                                PlayerData {
                                     max_speed: 300.0,
                                     color: thread_rng().gen(),
                                     fire_cooldown: 0.2
                                 },
-                                state: PlayerState {
+                                PlayerState {
                                     pos: Vec2::new(0.0, 0.0),
                                     directive: PlayerDirective::Idle,
                                     remaining_fire_cooldown: 0.0
                                 }
-                            };
+                            );
 
                             // Add the entity to the spawn queue
                             self.spawn_queue.push_back((entity_id, Box::new(player_actor)));
