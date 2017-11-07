@@ -7,7 +7,7 @@ use futures::sync::oneshot;
 use na::{Vector2};
 use rand::{Rand, Rng, thread_rng};
 
-use std::cell::{RefCell};
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, Condvar};
 use std::sync::mpsc::{channel, Sender, SendError, Receiver};
@@ -18,6 +18,7 @@ use tokio_timer::{Timer, wheel};
 
 use self::actor::*;
 use self::actor::player::*;
+use self::actor::bullet::*;
 
 pub type EntityId = u64;
 
@@ -46,19 +47,6 @@ impl Color {
 
 
 
-/// Static attributes of a "bullet"
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-pub struct BulletData {
-    vel: Vec2,
-    color: Color,
-}
-
-/// Dynamic attributes of a "bullet"
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-pub struct BulletState {
-    pos: Vec2,
-    remaining_life: Duration,
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct Vec2{
@@ -81,6 +69,11 @@ impl Vec2 {
     }
     fn to_vec(&self) -> Vector2<f64> {
         Vector2::from([self.x, self.y])
+    }
+}
+impl <'a> From<&'a Vector2<f64>> for Vec2 {
+    fn from(v: &'a Vector2<f64>) -> Self {
+        Vec2::new(v.x, v.y)
     }
 }
 
@@ -172,6 +165,7 @@ impl PositionQueryResult {
     }
 }
 
+/// A restricted view of a Game, passed to `GameActors` to allow certain interactions with the game world.
 pub struct ActorGameHandle<'a> {
     id: EntityId,
     game: &'a Game,
@@ -189,8 +183,61 @@ impl <'a> ActorGameHandle<'a> {
         };
         PositionQueryResult(inner_result)
     }
+
+    fn despawn_self(&self) -> () {
+        self.despawn(self.id);
+    }
+
+    fn despawn(&self, entity_id: EntityId) -> () {
+        self.game.despawn_queue.push(entity_id);
+    }
+
+    fn spawn(&self, actor: Box<GameActor>) -> EntityId {
+        let entity_id = self.game.entity_id_gen.next();
+        self.game.spawn_queue.push((entity_id, actor));
+        entity_id
+    }
 }
 
+pub struct GameQueue<T> {
+    queue: RefCell<VecDeque<T>>,
+}
+impl <T> GameQueue<T> {
+    pub fn new() -> GameQueue<T> {
+        GameQueue { queue: RefCell::new(VecDeque::new()) }
+    }
+    pub fn drain(&self) -> GameQueueDrain<T> {
+        GameQueueDrain { borrowed_queue: self.queue.borrow_mut() }
+    }
+    pub fn push(&self, item: T) -> () {
+        self.queue.borrow_mut().push_back(item);
+    }
+}
+
+pub struct GameQueueDrain<'a, T: 'a> {
+    borrowed_queue: RefMut<'a, VecDeque<T>>,
+}
+impl <'a, T: 'a> Iterator for GameQueueDrain<'a, T>{
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.borrowed_queue.pop_front()
+    }
+}
+
+pub struct EntityIdGenerator {
+    next: Cell<EntityId>,
+}
+impl EntityIdGenerator {
+    pub fn new() -> EntityIdGenerator {
+        EntityIdGenerator{ next: Cell::new(1) }
+    }
+    pub fn next(&self) -> EntityId {
+        let next = self.next.get();
+        self.next.set(next + 1);
+        next
+    }
+}
 
 /// Handle for starting the game loop thread.
 ///
@@ -213,12 +260,12 @@ impl GameStartHandle {
 }
 
 pub struct Game {
-    next_entity_id: EntityId,
+    entity_id_gen: EntityIdGenerator,
     clients: Vec<ConnectedPlayer>,
     entity_ids: BTreeSet<EntityId>,
     actors: BTreeMap<EntityId, ActorRef>,
-    spawn_queue: VecDeque<(EntityId, Box<GameActor>)>,
-    despawn_queue: VecDeque<EntityId>,
+    spawn_queue: GameQueue<(EntityId, Box<GameActor>)>,
+    despawn_queue: GameQueue<EntityId>,
     inputs: Receiver<GameInput>,
     connections_changes: Receiver<ConnectionStateChange>,
 }
@@ -238,12 +285,12 @@ impl Game {
             }
 
             let mut game = Game {
-                next_entity_id: 1,
+                entity_id_gen: EntityIdGenerator::new(),
                 clients: Vec::new(),
                 entity_ids: BTreeSet::new(),
                 actors: BTreeMap::new(),
-                spawn_queue: VecDeque::new(),
-                despawn_queue: VecDeque::new(),
+                spawn_queue: GameQueue::new(),
+                despawn_queue: GameQueue::new(),
                 inputs: input_receiver,
                 connections_changes: connection_receiver,
             };
@@ -296,7 +343,7 @@ impl Game {
         self.handle_connections();
         self.handle_inputs();
 
-        while let Some(to_despawn) = self.despawn_queue.pop_front() {
+        for to_despawn in self.despawn_queue.drain() {
             let did_despawn = self.actors.remove(&to_despawn).is_some();
             self.entity_ids.remove(&to_despawn);
 
@@ -337,7 +384,7 @@ impl Game {
         }
 
         // pump the spawn queue into the entity collection, and let clients know
-        while let Some((id, mut entity)) = self.spawn_queue.pop_front() {
+        for (id, mut entity) in self.spawn_queue.drain() {
             entity.on_spawn();
             self.entity_ids.insert(id);
             let init_memo = entity.to_init_memo();
@@ -354,13 +401,11 @@ impl Game {
         for connection_state_change in self.connections_changes.try_iter() {
             match connection_state_change {
                 ConnectionStateChange::NewConnection { entity_id_channel, updates_channel } => {
-                    let entity_id = self.next_entity_id;
-                    self.next_entity_id += 1;
+                    let entity_id = self.entity_id_gen.next();
 
                     match entity_id_channel.send(entity_id) {
                         Err(unsent_id) => {
-                            // connection must have dropped already. Don't add the entity; reuse the id.
-                            self.next_entity_id = unsent_id;
+                            // connection must have dropped already. Don't add the entity.
                         },
                         Ok(()) => {
                             // add a new client based on the connection information given
@@ -372,20 +417,12 @@ impl Game {
 
                             // create a new Player entity for the connected player
                             let player_actor = PlayerActor::new(
-                                PlayerData {
-                                    max_speed: 300.0,
-                                    color: thread_rng().gen(),
-                                    fire_cooldown: 0.2
-                                },
-                                PlayerState {
-                                    pos: Vec2::new(0.0, 0.0),
-                                    directive: PlayerDirective::Idle,
-                                    remaining_fire_cooldown: 0.0
-                                }
+                                thread_rng().gen(),
+                                Vec2::new(100.0, 100.0)
                             );
 
                             // Add the entity to the spawn queue
-                            self.spawn_queue.push_back((entity_id, Box::new(player_actor)));
+                            self.spawn_queue.push((entity_id, Box::new(player_actor)));
 
                         },
                     }
@@ -393,7 +430,7 @@ impl Game {
                 },
                 ConnectionStateChange::Dropped(entity_id) => {
                     self.clients.retain(|client| client.pawn_id != entity_id);
-                    self.despawn_queue.push_back(entity_id);
+                    self.despawn_queue.push(entity_id);
                 }
             }
         }

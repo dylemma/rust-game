@@ -6,6 +6,8 @@ use game::actor::player::*;
 use futures::{future, Future, Sink, Stream};
 use futures::sync::mpsc::{unbounded as stream_channel};
 
+use na::Vector2;
+
 use graphics::ellipse;
 use piston_window::*;
 
@@ -21,6 +23,107 @@ struct GameClientIOMessages;
 impl IOMessages for GameClientIOMessages {
     type Input = GameStateUpdate;
     type Output = GameInput;
+}
+
+/// Raw inputs from the player's keyboard and mouse
+struct PlayerControlState {
+    mouse_pos: Vec2,
+    mouse_down: bool,
+    ctrl_down: bool,
+}
+impl PlayerControlState {
+    fn new() -> PlayerControlState {
+        PlayerControlState{
+            mouse_pos: Vec2::new(0.0, 0.0),
+            mouse_down: false,
+            ctrl_down: false
+        }
+    }
+}
+
+/// Interpreted inputs from the player.
+///
+/// Keeps track of the raw state as well as the previous "directive",
+/// to allow for "sticky" states that are not reset when controls are released.
+struct PlayerControls {
+    state: PlayerControlState,
+    directive: PlayerDirective
+}
+impl PlayerControls {
+    fn new() -> PlayerControls {
+        PlayerControls {
+            state: PlayerControlState::new(),
+            directive: PlayerDirective::Idle
+        }
+    }
+
+    fn check_directive_change(&mut self, event: &Event) -> Option<PlayerDirective> {
+        let mut hit_event = false;
+
+        // track mouse position
+        event.mouse_cursor(|x, y| {
+            self.state.mouse_pos.x = x;
+            self.state.mouse_pos.y = y;
+            hit_event = true;
+        });
+
+        // reset button states if the window loses focus
+        event.focus(|is_focused| {
+            if !is_focused {
+                self.state.mouse_down = false;
+                self.state.ctrl_down = false;
+                hit_event = true;
+            }
+        });
+
+        // watch for keyboard/mouse activity
+        event.button(|btn| {
+            match btn.button {
+                // left click
+                Button::Mouse(MouseButton::Left) => {
+                    hit_event = true;
+                    self.state.mouse_down = match btn.state {
+                        ButtonState::Press => true,
+                        ButtonState::Release => false,
+                    };
+                },
+                // ctrl key
+                Button::Keyboard(Key::LCtrl) => {
+                    hit_event = true;
+                    self.state.ctrl_down = match btn.state {
+                        ButtonState::Press => true,
+                        ButtonState::Release => false,
+                    }
+                }
+                _ => ()
+            }
+        });
+
+        if hit_event {
+            let new_directive = {
+                let PlayerControlState { mouse_pos, mouse_down, ctrl_down } = self.state;
+                if mouse_down {
+                    let target = Target::Location(mouse_pos);
+                    if ctrl_down {
+                        PlayerDirective::FiringAt(target)
+                    } else {
+                        PlayerDirective::MovingToward(target)
+                    }
+                } else {
+                    if self.directive.is_moving() {
+                        // keep moving towards the target even if the mouse was released
+                        self.directive
+                    } else {
+                        PlayerDirective::Idle
+                    }
+                }
+            };
+            self.directive = new_directive;
+            Some(new_directive)
+        } else {
+            None
+        }
+    }
 }
 
 pub fn run() {
@@ -81,13 +184,11 @@ pub fn run() {
     let border_margin = 10.0;
     let border = Rectangle::new_border([0., 0., 0., 1.], 0.5);
 
-    // let chara
     let character_radius = 10.0;
     let character_border = Ellipse::new_border([0.5, 0.5, 0.5, 1.0], 0.5);
 
     // values related to mouse-based character movement
-    let mut mouse_pos = [0.0, 0.0];
-    let mut is_mouse_down = false;
+    let mut player_controls = PlayerControls::new();
 
     let mut updated_since_render = false;
 
@@ -95,32 +196,9 @@ pub fn run() {
 
     while let Some(event) = window.next() {
 
-        // track mouse position
-        event.mouse_cursor(|x, y| {
-            mouse_pos[0] = x;
-            mouse_pos[1] = y;
-            if is_mouse_down {
-                let directive = PlayerDirective::MovingToward(Target::Location(Vec2::new(x, y)));
-                input_send.unbounded_send(directive).unwrap();
-            }
-        });
-
-        // track mouse left-click state
-        event.button(|btn| {
-            match btn.button {
-                Button::Mouse(MouseButton::Left) => {
-                    match btn.state {
-                        ButtonState::Press => {
-                            is_mouse_down = true;
-                            let directive = PlayerDirective::MovingToward(Target::Location(Vec2::new(mouse_pos[0], mouse_pos[1])));
-                            input_send.unbounded_send(directive).unwrap();
-                        },
-                        ButtonState::Release => is_mouse_down = false
-                    }
-                },
-                _ => ()
-            }
-        });
+        if let Some(new_directive) = player_controls.check_directive_change(&event) {
+            input_send.unbounded_send(new_directive);
+        }
 
         event.update(|_| {
             if !updated_since_render {
@@ -162,7 +240,7 @@ pub fn run() {
 
                 for entity in entities.values_mut() {
                     match *entity {
-                        ActorInitMemo::Player(ref mut state, ref attributes) => {
+                        ActorInitMemo::Player(ref state, ref attributes) => {
                             let pos = state.pos;
                             let circle = Ellipse::new(attributes.color.to_vec4());
                             let circle_bounds = ellipse::circle(pos.x, pos.y, character_radius);
@@ -170,6 +248,16 @@ pub fn run() {
                             circle.draw(circle_bounds, &draw_state, context.transform, graphics);
                             character_border.draw(circle_bounds, &draw_state, context.transform, graphics);
                         },
+                        ActorInitMemo::Bullet(ref state, ref attributes) => {
+                            let line = Line::new_round(attributes.color.to_vec4(), 3.0);
+                            let pos = state.pos;
+                            let vel = attributes.vel;
+                            let mut vel = Vector2::new(vel.x, vel.y);
+                            vel.normalize_mut();
+                            vel *= 5.0;
+                            let line_coords = [pos.x - vel.x, pos.y - vel.y, pos.x + vel.x, pos.y + vel.y];
+                            line.draw(line_coords, &draw_state, context.transform, graphics);
+                        }
                     }
                 }
 
